@@ -1,0 +1,18 @@
+---
+description: Name generation, hash, templates — pure functions and rules
+globs:
+  - "**/name_generator.py"
+  - "**/hash_utils.py"
+  - "**/template_engine.py"
+---
+
+# Name generation and hashing
+
+- **`generate_name()`** must be a **pure function**: **no I/O** (no DB, API, filesystem, `input`, env reads). Inputs are in-memory values only.
+- **`compute_source_hash()`** (or equivalent in `hash_utils`) must be a **pure function**: **no I/O** — stable canonical input → hash string.
+- **`year_to = 0`** means **«н.в.» (present)** — **not** “empty” or “omit years”. Display/range logic must treat 0 as the live-end marker (e.g. `2018-н.в.`).
+- In the **product `name`**, include **only the primary fitment** (per PROJECT_CONTEXT) — not the full list of fitments.
+- The word **«для»** in the name template is included **only** when there is at least both **make** and **model** (minimum pair for a meaningful “for [vehicle]” phrase). Do not insert «для» with only one of them unless business rules say otherwise.
+- **Maximum name length: 255** characters; truncate or validate consistently with the API constraint.
+- **Empty tokens** must not produce **double spaces** or leading/trailing space artifacts — collapse whitespace after joining segments.
+- If required fields for generation are missing, set/return status **`"error"`** (and a clear message where applicable) per `GENERATION_STATUSES`.

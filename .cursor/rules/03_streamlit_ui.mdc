@@ -1,0 +1,16 @@
+---
+description: Streamlit UI — session state, DRY_RUN, pages, caching
+globs:
+  - "**/app.py"
+  - "**/pages/*.py"
+---
+
+# Streamlit UI (NameForge)
+
+- **`st.session_state` is initialized only in `app.py`** (entry/main). Pages must not re-run full init; they read/update keys as needed.
+- **`preview_name`**, **`preview_description`**, **`candidate_hash`** are **ephemeral** — store **only in `st.session_state`**, **never** in SQLite (until a successful `approve_and_sync` persists `source_hash` / status per PROJECT_CONTEXT).
+- **DRY_RUN toggle** in the **sidebar** must **always** be visible (not hidden in expanders for the primary safety switch).
+- **Save / “Сохранить”** (or any control that would persist to МойСклад or perform non-preview writes): **disabled when `dry_run` is True** (or show an explicit block — default is disabled).
+- **Reference data / dictionaries** (templates list, alias types, etc.): cache with **`@st.cache_data(ttl=3600)`** where appropriate to avoid repeated DB/API hits.
+- **Batch operations** (queue preview, batch approve): show progress with **`st.progress()`** (and clear messaging).
+- **Four screens:** **Очередь** (queue), **Карточка** (card), **Шаблоны** (templates), **Алиасы** (aliases) — align file names and navigation with this structure (`pages/01_queue.py`, `02_card`, `03_templates`, aliases page as planned).

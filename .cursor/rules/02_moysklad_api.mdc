@@ -1,0 +1,26 @@
+---
+description: МойСклад API — limits, headers, attributes, errors (moysklad_client)
+globs:
+  - "**/moysklad_client.py"
+---
+
+# МойСклад API (see PROJECT_CONTEXT)
+
+- **Rate limit:** ~**100 requests per 5 seconds**. In any loop that may issue back-to-back requests, use **`time.sleep(0.1)`** between calls (e.g. between PUTs in batch approve/sync) to stay under the limit.
+- **Batch size:** at most **50** products per batch operation (per PROJECT_CONTEXT: batch generate / batch approve).
+- **HTTP headers:** **`Authorization: Bearer <token>`** and **`Accept-Encoding: gzip`** (and send requests in a way compatible with compressed responses).
+- **Custom attributes in API payload:** read/iterate attributes as a **list** of attribute objects, **not** as a dict keyed by id — code must not assume a map shape.
+- **Attribute UUIDs:** do **not** hardcode UUID strings. **Resolve attribute meta by name at app startup** (or first use), then **cache** resolved ids in **`st.session_state`** (or a single app-level cache passed into the client) for the session.
+- **Errors:** handle at least:
+  - **401** — auth failure: clear message, do not spin retry loops without re-auth
+  - **429** — rate limit: back off, optional retry with delay
+  - **Other HTTP / network errors** — surface safely, log context, do not leave DB/API in an inconsistent state without documented recovery
+- All of the above is implemented **only** in `moysklad_client.py` so the rest of the app calls one module.
+Официальная документация МойСклад JSON API 1.2:
+https://dev.moysklad.ru/doc/api/remap/1.2/
+
+Конкретные разделы:
+- Метаданные: #header-метаданные
+- Доп. поля: #header-работа-с-дополнительными-полями
+- Товары: /dictionaries/#tovary-tovar
+- Справочники: /dictionaries/#pol-zovatel-skie-sprawochniki

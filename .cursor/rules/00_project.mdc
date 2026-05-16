@@ -1,0 +1,21 @@
+---
+description: NameForge project-wide conventions (Streamlit, SQLite, MoySklad)
+alwaysApply: true
+---
+
+# NameForge — project rules
+
+- This is a **desktop Streamlit** application for a **single operator**.
+- **Project root:** `c:\PyProject\NameForge\`
+- **Database:** `data/autoname.db` (SQLite)
+- **Default `DRY_RUN=True`** — no PUTs to МойСклад without explicit confirmation; treat dry-run as the safe default.
+- **Project Handoff Summary:** Refer to `docs/HANDOFF.md` for the current project status and next steps.
+- **All write operations** must check `settings.dry_run` (or equivalent) and skip or no-op real API writes when dry-run is enabled.
+- **Idempotency via `source_hash`:** perform PUT in МойСклад only when the hash has **changed** since the last successful sync (do not re-PUT identical content).
+- **`name_locked = 1`:** never overwrite the product name; respect lock in approve/sync and preview-to-approved flows.
+- **All МойСклад HTTP calls** go only through `src/moysklad_client.py` — no ad-hoc `requests` elsewhere.
+- **No hardcoded UUIDs** — resolve and cache attribute/product identifiers via config, env, or API lookup as designed.
+- Use **`sqlite3` from the stdlib** only — **no ORM** (no SQLAlchemy, etc.).
+- **Pydantic** for models at **layer boundaries** (API DTOs, service inputs/outputs where useful).
+- **Code** (identifiers, comments in code, docstrings): **English**. **UI strings** (Streamlit labels, messages): **Russian**.
+- **Linting:** **Ruff** (`ruff`).

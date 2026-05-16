@@ -1,0 +1,16 @@
+---
+description: SQLite access, transactions, fitment invariants
+globs:
+  - "**/db.py"
+  - "**/fitment_repo.py"
+  - "**/*_repo.py"
+---
+
+# Database (SQLite)
+
+- **Connections:** use **`get_conn()`** as a **context manager** from `src/db.py` (or the canonical module that wraps `sqlite3` with `foreign_keys`, WAL, commit/rollback). Do not open ad-hoc connections scattered across the codebase.
+- **Transactions that touch `fitment` (and related `products` primary fields):** use **`BEGIN IMMEDIATE`** (or equivalent) so concurrent writers serialize correctly on fitment updates.
+- **`save_fitment` semantics:** **DELETE all fitment rows for the product, then INSERT** the new set (full replace). Do not patch rows piecemeal in a way that could leave orphan or duplicate primary rows.
+- **Exactly one `is_primary = 1` row** per product is **enforced in the same transaction** as the fitment write (and matches PROJECT_CONTEXT partial unique index intent).
+- **`updated_at`:** updated by **database triggers** when the row changes and the app did not set `updated_at` explicitly (per schema in PROJECT_CONTEXT) — do not rely only on app-side timestamps for audit.
+- **`year_to = 0`** in DB is a **valid value** meaning **«н.в.»** — validators and queries must not treat 0 as NULL or “unknown” for year-end.

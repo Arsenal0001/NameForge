@@ -1,0 +1,43 @@
+---
+description: Skill for parsing and normalizing dirty vendor catalogs for Odoo 19 PIM
+globs: ["*.csv", "*.jsonl", "*.xlsx", "*.m", "*parser*.py"]
+---
+# Odoo Catalog Parsing & Normalization Skill
+
+This skill provides guidelines and best practices for parsing dirty vendor catalogs, normalizing data, and preparing it for Odoo 19 PIM or AutoPrice Matchers. It is based on the proven architecture from the `moysklad_to_odoo_parser` project.
+
+## 1. Architectural Principles
+- **Never use RegEx for complex extraction.** Always use an LLM (e.g., `google/gemini-2.5-pro` via OpenRouter) with Structured Outputs (JSON) to parse messy names.
+- **Context is King.** Always pass the product's Category/Group to the LLM alongside the raw name. This drastically improves extraction accuracy.
+- **Robust Batching.** Process large catalogs (e.g., 15k+ rows) in asynchronous batches (size ~25). Implement exponential backoff, auto-recovery (halving batch size on failure), and save progress to `progress.json`.
+- **JSONL Format.** Write output in JSON Lines (`.jsonl`) format continuously to prevent data loss.
+
+## 2. The "Golden Middle" Extraction Strategy
+Do not extract too atomically (losing meaning) or too broadly (keeping attributes in the type). 
+- `golden_type`: The base product type (e.g., "Радиатор охлаждения двигателя"). NO attributes, NO applicability here.
+- `applicability`: A structured object/array for fitment (`make`, `model`, `generation`, `years`, `engine`). Use `{"is_universal": true}` for generic items.
+- `attributes`: A deeply detailed dictionary for all other specs (`color`, `material`, `voltage`, `axis`, `side`, etc.).
+
+## 3. Odoo Naming Convention
+Generate human-readable names for Odoo using the 4-6 part formula:
+`[golden_type] + [installation_location] + [applicability] + [1-2 key attributes] + [brand]`
+*Example:* `Радиатор охлаждения двигателя Lada Granta МКПП С кондиционером LUZAR`
+
+## 4. Power Query (M) / Pandas Post-Processing
+When converting JSONL to Excel (`.xlsx`) for Odoo import:
+- Dynamically extract all unique keys from the `attributes` dictionary to create columns.
+- Normalize and translate LLM-generated English keys to Russian (e.g., `installation_location` -> `Место установки`).
+- Handle list attributes by joining them with commas.
+- Merge duplicate columns that arise from LLM synonyms (e.g., `condition` and `state`).
+
+## 5. Reference Prompt (The Golden Middle)
+When instructing the LLM, use this prompt structure:
+```text
+Ты архитектор PIM-системы Odoo. Разбери автозапчасти по методу "Золотой середины".
+1. `id`: Оригинальный ID
+2. `golden_type`: Базовый тип (без авто, цвета, материала).
+3. `brand`: Бренд
+4. `applicability`: Марка, Модель, Поколение, Годы, Двигатель. Или {"is_universal": true}.
+5. `attributes`: Все остальные характеристики по логичным ключам.
+Верни СТРОГИЙ JSON массив.
+```

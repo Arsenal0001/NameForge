@@ -1,0 +1,14 @@
+---
+description: Pytest layout and testing constraints for NameForge
+globs:
+  - "**/test_*.py"
+---
+
+# Testing
+
+- **Runner:** **pytest**; test modules live under **`tests/`** (e.g. `tests/test_foo.py`).
+- **`name_generator`:** test **`generate_name()`** as a **pure function** — fixed inputs, assert exact outputs; no DB or mocks of I/O inside the function under test.
+- **`hash_utils`:** test **`compute_source_hash()`** (or equivalent) for **stability** (same input → same hash) and for **change** when any canonical input field differs; no I/O.
+- **`fitment_repo` (and other repos):** use an **in-memory SQLite** database (`:memory:`) with schema applied via `init_db` or test fixtures — fast, isolated, no `data/autoname.db` in tests.
+- **`moysklad_client`:** tests use **mocks** (e.g. `unittest.mock`, `httpx`/`requests` mock) for HTTP — **no real network** calls to МойСклад in automated tests.
+- **Before sending work to Cursor / opening a PR:** **all tests must pass** (`pytest` green). Fix failures before handoff.
