@@ -67,6 +67,8 @@ class Product(Base):
     search_keywords: Mapped[str | None] = mapped_column(Text, nullable=True)
     synced_at: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attribute_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attributes_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     source_hash: Mapped[str] = mapped_column(Text, nullable=False, default="")
     created_at: Mapped[str] = mapped_column(Text, nullable=False)

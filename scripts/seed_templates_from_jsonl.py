@@ -30,6 +30,7 @@ from sqlalchemy import select  # noqa: E402
 from app.core.database import SessionLocal  # noqa: E402
 from app.core.schema_patches import apply_schema_patches  # noqa: E402
 from app.core.database import engine  # noqa: E402
+import app.models.product_fitment  # noqa: F401,E402 — register ProductVehicleFitment mapper
 from app.models.odoo_catalog_cache import OdooCategory  # noqa: E402
 from app.services.template_service import get_template_engine  # noqa: E402
 
@@ -39,85 +40,102 @@ DEFAULT_JSONL = _ROOT / "data" / "odoo_master_catalog.jsonl"
 GOLDEN_TYPE_FORMULAS: dict[str, str] = {
     # Interior / accessories (NAMING_TEMPLATES_V2 §3 group 1)
     "Коврик салона": (
-        "{part_type} {installation} {fitment_core} {characteristics} {brand}"
+        "{part_type} {installation} {fitment_core} {attributes} {brand}"
     ),
     "Коврик багажника": (
-        "{part_type} {installation} {fitment_core} {characteristics} {brand}"
+        "{part_type} {installation} {fitment_core} {attributes} {brand}"
     ),
     "Чехол сиденья": (
-        "{part_type} {fitment_core} {characteristics} {brand}"
+        "{part_type} {fitment_core} {attributes} {brand}"
     ),
     "Чехлы сидений": (
-        "{part_type} {fitment_core} {characteristics} {brand}"
+        "{part_type} {fitment_core} {attributes} {brand}"
     ),
     "Накидка на сиденье": (
-        "{part_type} {fitment_core} {characteristics} {brand}"
+        "{part_type} {fitment_core} {attributes} {brand}"
     ),
     "Ароматизатор": (
-        "{part_type} {installation} {characteristics} {brand}"
+        "{part_type} {installation} {attributes} {brand}"
     ),
     # Lighting / electrics (group 2)
     "Лампа автомобильная": (
-        "{part_type} {characteristics} {brand}"
+        "{part_type} {attributes} {brand}"
     ),
     "Лампа светодиодная": (
-        "{part_type} {characteristics} {brand}"
+        "{part_type} {attributes} {brand}"
     ),
     "Автолампа": (
-        "{part_type} {characteristics} {brand}"
+        "{part_type} {attributes} {brand}"
     ),
     "Блок-фара": (
-        "{part_type} {side} {fitment_core} {characteristics} {brand}"
+        "{part_type} {side} {fitment_core} {attributes} {brand}"
     ),
     "Фара противотуманная": (
-        "{part_type} {side} {fitment_core} {characteristics} {brand}"
+        "{part_type} {side} {fitment_core} {attributes} {brand}"
     ),
     "Магнитола": (
-        "{part_type} {fitment_core} {characteristics} {brand}"
+        "{part_type} {fitment_core} {attributes} {brand}"
     ),
     "Свеча зажигания": (
-        "{part_type} {fitment_core} {brand}"
+        "{part_type} {fitment_core} {attributes} {brand}"
+    ),
+    "Стартер": (
+        "{part_type} для {make} {model} {attributes} {brand}"
     ),
     # Suspension / brakes (group 4)
     "Амортизатор": (
-        "{part_type} {side} {fitment_core} {characteristics} {brand}"
+        "{part_type} {side} {fitment_core} {attributes} {brand}"
     ),
     "Колодки тормозные": (
-        "{part_type} {side} {fitment_core} {characteristics} {brand}"
+        "{part_type} {side} {fitment_core} {attributes} {brand}"
     ),
     "Диск тормозной": (
-        "{part_type} {side} {fitment_core} {characteristics} {brand}"
+        "{part_type} {side} {fitment_core} {attributes} {brand}"
     ),
     "Подшипник ступицы": (
-        "{part_type} {side} {fitment_core} {characteristics} {brand}"
+        "{part_type} {side} {fitment_core} {attributes} {brand}"
     ),
     # Engine / cooling (group 5)
     "Радиатор охлаждения": (
-        "{part_type} {fitment_core} {characteristics} {brand}"
+        "{part_type} {fitment_core} {attributes} {brand}"
     ),
     "Радиатор охлаждения двигателя": (
-        "{part_type} {fitment_core} {characteristics} {brand}"
+        "{part_type} {fitment_core} {attributes} {brand}"
     ),
     "Патрубок охлаждения": (
-        "{part_type} {installation} {fitment_core} {characteristics} {brand}"
+        "{part_type} {installation} {fitment_core} {attributes} {brand}"
     ),
     # Fluids / consumables (group 6)
     "Масло моторное": (
-        "{part_type} {characteristics} {brand}"
+        "{part_type} {attributes} {brand}"
     ),
     "Аккумулятор": (
-        "{part_type} {characteristics} {brand}"
+        "{part_type} {attributes} {brand}"
     ),
     "Щетка стеклоочистителя": (
-        "{part_type} {characteristics} {brand}"
+        "{part_type} {attributes} {brand}"
     ),
     "Антикор": (
-        "{part_type} {installation} {characteristics} {brand}"
+        "{part_type} {installation} {attributes} {brand}"
+    ),
+    "Антигравий": (
+        "{part_type} {attributes} {brand}"
+    ),
+    "Консервант антикоррозийный": (
+        "{part_type} {attributes} {brand}"
     ),
     # Fallback (NAMING_TEMPLATES_V2 §3 bottom)
     "_fallback": (
-        "{part_type} {fitment_core} {characteristics} {brand}"
+        "{part_type} {fitment_core} {attributes} {brand}"
     ),
+}
+
+# JSONL ``group`` paths with explicit formulas (skip majority vote when types are mixed).
+CATEGORY_GROUP_OVERRIDES: dict[str, str] = {
+    "Электрика/Стартеры и комплектующие": (
+        "{part_type} для {make} {model} {attributes} {brand}"
+    ),
+    "Автохимия/Антикор": "{part_type} {attributes} {brand}",
 }
 
 CATEGORY_FIELD_KEYS = ("Категория (Группа)", "group", "Группа", "category")
@@ -155,6 +173,17 @@ def _field(row: dict, keys: tuple[str, ...]) -> str:
         if text:
             return text
     return ""
+
+
+def _lookup_group_override(category_label: str) -> str | None:
+    key = category_label.strip()
+    if key in CATEGORY_GROUP_OVERRIDES:
+        return CATEGORY_GROUP_OVERRIDES[key]
+    key_cf = _normalize_category_key(key)
+    for reg_key, formula in CATEGORY_GROUP_OVERRIDES.items():
+        if _normalize_category_key(reg_key) == key_cf:
+            return formula
+    return None
 
 
 def _lookup_formula(golden_type: str) -> str | None:
@@ -252,6 +281,38 @@ def plan_seeds(
 ) -> list[CategorySeedPlan]:
     plans: list[CategorySeedPlan] = []
     for category_label, types in sorted(groups.items(), key=lambda x: x[0].casefold()):
+        override_formula = _lookup_group_override(category_label)
+        if override_formula is not None:
+            odoo_cat = resolve_odoo_category(category_label, category_index)
+            if odoo_cat is None:
+                print(
+                    f"WARNING: override skip «{category_label}» — Odoo category not in "
+                    f"local cache (sync catalog first)"
+                )
+                plans.append(
+                    CategorySeedPlan(
+                        category_label=category_label,
+                        golden_type="(group_override)",
+                        formula=override_formula,
+                        confidence_pct=100.0,
+                        sample_count=len(types),
+                        skipped_reason="odoo_category_not_found",
+                    )
+                )
+                continue
+            plans.append(
+                CategorySeedPlan(
+                    category_label=category_label,
+                    golden_type="(group_override)",
+                    formula=override_formula,
+                    confidence_pct=100.0,
+                    sample_count=len(types),
+                    odoo_category_id=odoo_cat.odoo_id,
+                    odoo_category_name=odoo_cat.complete_name or odoo_cat.name,
+                )
+            )
+            continue
+
         golden_type, confidence = _majority(types)
         if golden_type is None:
             reason = (

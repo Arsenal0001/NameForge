@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from typing import Any
 
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.models.product import Product
 from app.schemas.sync import SyncLogEntry, SyncOdooResponse
+from app.services.odoo_attribute_sync import merge_product_attributes_into_write_values
 from app.services.odoo_catalog_sync import utc_iso_timestamp
 from app.services.odoo_client import OdooClient, OdooClientError
 from app.services.template_service import generate_preview_for_product
@@ -44,7 +46,7 @@ class _SyncCounters:
     errors: int = 0
     synced_product_ids: list[int] = field(default_factory=list)
     log: list[SyncLogEntry] = field(default_factory=list)
-    pending_writes: list[tuple[int, Product, list[int], dict[str, str], str]] = field(
+    pending_writes: list[tuple[int, Product, list[int], dict[str, Any], str]] = field(
         default_factory=list,
     )
 
@@ -120,10 +122,12 @@ class SyncService:
             candidate_hash = (product.source_hash or "").strip()
 
             if preview_result is not None:
-                if not name:
-                    name = (preview_result.name or "").strip()
-                if not keywords:
-                    keywords = (preview_result.search_keywords or "").strip()
+                preview_name = (preview_result.name or "").strip()
+                if preview_name:
+                    name = preview_name
+                preview_keywords = (preview_result.search_keywords or "").strip()
+                if preview_keywords:
+                    keywords = preview_keywords
                 if preview_result.source_hash:
                     candidate_hash = preview_result.source_hash.strip()
 
@@ -152,7 +156,15 @@ class SyncService:
 
         stored_hash = (product.source_hash or "").strip()
         synced_at = (product.synced_at or "").strip()
-        if candidate_hash and stored_hash and candidate_hash == stored_hash and synced_at:
+        updated_at = (getattr(product, "updated_at", None) or "").strip()
+        product_stale = bool(synced_at and updated_at and updated_at > synced_at)
+        if (
+            candidate_hash
+            and stored_hash
+            and candidate_hash == stored_hash
+            and synced_at
+            and not product_stale
+        ):
             counters.skipped_idempotent += 1
             counters.log.append(
                 SyncLogEntry(
@@ -164,7 +176,8 @@ class SyncService:
             return
 
         odoo_id = int(odoo_raw)
-        values = {"name": name, SEARCH_KEYWORDS_FIELD: keywords}
+        values: dict[str, Any] = {"name": name, SEARCH_KEYWORDS_FIELD: keywords}
+        merge_product_attributes_into_write_values(self._client, product, values)
 
         if self._dry_run:
             counters.pushed += 1
@@ -193,55 +206,58 @@ class SyncService:
             self._session.rollback()
 
     def _flush_writes(self, counters: _SyncCounters) -> None:
-        for i in range(0, len(counters.pending_writes), self._chunk_size):
-            chunk = counters.pending_writes[i : i + self._chunk_size]
-            batch = [(odoo_ids, values) for _, _, odoo_ids, values, _ in chunk]
+        now = utc_iso_timestamp()
+        for product_id, product, odoo_ids, values, candidate_hash in counters.pending_writes:
             try:
-                self._client.batch_write("product.template", batch)
+                self._client.write("product.template", odoo_ids, values)
             except OdooClientError as exc:
-                logger.error("Odoo batch_write failed: %s", exc)
-                error_text = str(exc)
-                for product_id, _, _, _, _ in chunk:
-                    counters.errors += 1
-                    counters.log.append(
-                        SyncLogEntry(
-                            product_id=product_id,
-                            action="error",
-                            detail=error_text,
-                        )
-                    )
-                self._session.rollback()
-                for product_id, _, _, _, _ in chunk:
-                    self._persist_sync_error(product_id, error_text)
-                continue
-
-            now = utc_iso_timestamp()
-            for product_id, product, _odoo_ids, values, candidate_hash in chunk:
-                product.synced_at = now
-                product.last_sync_error = None
-                if candidate_hash:
-                    product.source_hash = candidate_hash
-                if not (product.generated_name or "").strip():
-                    product.generated_name = values.get("name")
-                if not (product.search_keywords or "").strip():
-                    product.search_keywords = values.get(SEARCH_KEYWORDS_FIELD) or None
-                self._session.add(product)
-                counters.pushed += 1
-                counters.synced_product_ids.append(product_id)
+                logger.error(
+                    "Odoo write failed for product_id=%s odoo_ids=%s: %s",
+                    product_id,
+                    odoo_ids,
+                    exc,
+                )
+                counters.errors += 1
                 counters.log.append(
                     SyncLogEntry(
                         product_id=product_id,
-                        action="pushed",
-                        detail="odoo_write_ok",
+                        action="error",
+                        detail=str(exc),
                     )
                 )
-            try:
-                self._session.commit()
-            except Exception as exc:
-                logger.exception("Failed to commit sync metadata")
-                self._session.rollback()
-                error_text = f"db_commit:{exc}"
-                for product_id, _, _, _, _ in chunk:
+                self._persist_sync_error(product_id, str(exc))
+                continue
+
+            product.synced_at = now
+            product.last_sync_error = None
+            if candidate_hash:
+                product.source_hash = candidate_hash
+            if not (product.generated_name or "").strip():
+                product.generated_name = values.get("name")
+            if not (product.search_keywords or "").strip():
+                product.search_keywords = values.get(SEARCH_KEYWORDS_FIELD) or None
+            self._session.add(product)
+            counters.pushed += 1
+            counters.synced_product_ids.append(product_id)
+            counters.log.append(
+                SyncLogEntry(
+                    product_id=product_id,
+                    action="pushed",
+                    detail="odoo_write_ok",
+                )
+            )
+
+        if counters.pushed == 0 and counters.errors == 0:
+            return
+
+        try:
+            self._session.commit()
+        except Exception as exc:
+            logger.exception("Failed to commit sync metadata")
+            self._session.rollback()
+            error_text = f"db_commit:{exc}"
+            for product_id, _, _, _, _ in counters.pending_writes:
+                if product_id in counters.synced_product_ids:
                     counters.errors += 1
                     counters.log.append(
                         SyncLogEntry(

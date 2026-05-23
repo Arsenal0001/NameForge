@@ -15,6 +15,8 @@ from sqlalchemy.orm import Session
 from app.core.database import SessionLocal, engine
 from app.core.schema_patches import apply_schema_patches
 from app.models.product import Product
+from app.services.attribute_parser import format_attributes_to_russian
+from app.services.text_utils import sanitize_token_value
 from app.services.fitment_service import (
     FitmentValidationError,
     TextFitmentInput,
@@ -182,12 +184,17 @@ def enrich_product_fields(product: Product, row: dict) -> None:
     if golden_type:
         product.part_type = golden_type
 
-    brand = _pick_text(row, "brand")
+    brand = sanitize_token_value(_pick_text(row, "brand"))
     if brand:
         product.brand = brand
 
     attrs = row.get("attributes")
     if isinstance(attrs, dict):
+        product.attributes_json = json.dumps(attrs, ensure_ascii=False, sort_keys=True)
+        formatted_attrs = format_attributes_to_russian(attrs)
+        if formatted_attrs:
+            product.attribute_summary = formatted_attrs
+
         side_axis = _pick_text(
             attrs,
             "side",

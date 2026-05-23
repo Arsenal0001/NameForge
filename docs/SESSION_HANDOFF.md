@@ -16,6 +16,8 @@
 
 **Odoo API:** выделенный пользователь, `ODOO_UID` + API key / password. Протокол — **только** `POST {ODOO_URL}/jsonrpc` → `execute_kw`. См. `odoo_api_knowledge.md`, клиент: `backend/app/services/odoo_client.py`.
 
+**Локализация RPC (критично):** все вызовы `execute_kw` через `OdooClient` принудительно получают `kwargs={"context": {"lang": "ru_RU"}}`. Без этого `product.template.name` (переводимое поле) пишется в `en_US`, а UI показывает старый `ru_RU`.
+
 **Запуск (локально):**
 ```bash
 # Backend
@@ -26,7 +28,7 @@ cd frontend && npm run dev   # http://localhost:5173
 ```
 
 **Маршруты SPA:**
-- `/` — **Главный дашборд** (KPI + Quick Actions)
+- `/` — **Главный дашборд** (KPI + Quick Actions + прогресс фоновых jobs)
 - `/catalog` — Data Grid каталога
 - `/categories`, `/templates` — настройка категорий и шаблонов
 
@@ -46,156 +48,158 @@ cd frontend && npm run dev   # http://localhost:5173
 | **Transform (JSONL → local)** | `scripts/enrich_catalog_from_jsonl.py --apply` | `POST /api/jobs/enrich` → `202` | `catalog_jsonl_enrichment.run_catalog_jsonl_enrichment()` |
 | **Load (Push local → Odoo)** | `scripts/mass_sync_to_odoo.py [--force-apply]` | `POST /api/jobs/push-to-odoo` → `202` | `mass_sync_job.run_mass_sync_to_odoo()` → `SyncService` |
 
+**Transport:**
+- Пакетный JSON-RPC-массив в одном HTTP POST давал **`HTTP 400`** на `erp.arszap.ru`.
+- **Исправлено:** `OdooClient.batch_write()` и `SyncService._flush_writes()` — **последовательные** `write` по одному товару, с `try/except` на каждый ID.
+
+**Push payload (`SyncService`):**
+- `name` + `x_search_keywords` на `product.template`
+- `attribute_line_ids` — нативные атрибуты Odoo (см. §2.2)
+- Preview-first: для незабlocked товаров в Odoo уходит **свежий preview**, а не stale `generated_name`
+
 **Background Jobs (`backend/app/api/routers/jobs.py`):**
 - Немедленный ответ **`202 Accepted`**; работа в `BackgroundTasks` FastAPI.
-- Каждый runner создаёт **собственный** `SessionLocal()` (изоляция от request-session).
-- **In-memory mutex** (`job_lock.py`): повторный запуск того же job → **`409 Conflict`** (`Job is already running`).
-- Логика вынесена в сервисы (`job_tasks.py`, `catalog_jsonl_enrichment.py`, `mass_sync_job.py`); CLI переиспользует те же функции.
+- **In-memory mutex** (`job_lock.py`): повторный запуск → **`409 Conflict`**.
+- **Job progress (DONE):** `GET /api/jobs/active`, виджет на `MainDashboard.tsx`.
 
 **Рекомендуемый порядок полного цикла (CLI):**
 ```bash
 python scripts/sync_odoo_categories.py
 python scripts/sync_catalog_from_odoo.py
 python scripts/enrich_catalog_from_jsonl.py --apply
+python scripts/seed_templates_from_jsonl.py --apply   # odoo_categories.name_pattern
 python scripts/mass_sync_to_odoo.py               # DRY_RUN симуляция
 python scripts/mass_sync_to_odoo.py --force-apply # live → erp.arszap.ru
 ```
 
-### 2.2 Главный дашборд — DONE
+**Canary E2E (точечная проверка 5 SKU):**
+```bash
+python scripts/run_canary_test.py   # TARGET_CODES: 04966, 06575, 11064, 17128, 16300
+```
+При старте выводит **`Odoo target DB: 'stable_arszap'`** — сверить с базой в браузере. После Load — **Verification Read** (`search_read` в `ru_RU`) и колонка «Имя после проверки в Odoo».
+
+### 2.2 Атрибуты и именование — DONE (Priority Weights + Native Odoo Attributes)
 
 | Компонент | Назначение |
 |-----------|------------|
-| **`GET /api/metrics/dashboard`** | SQL-агрегаты KPI: `total_products`, `synced`, `pending`, `locked` (только локальный кэш, без Odoo HTTP) |
-| **`MainDashboard.tsx`** | 4 KPI-карточки; TanStack Query `refetchInterval` ~45 с |
-| **Quick Actions** | Кнопки «Скачать из Odoo», «Обогатить из JSONL», «Массовая отправка» → `POST /api/jobs/*` + Sonner toast |
+| **`attribute_parser.py`** | `PRIORITY_WEIGHTS` + `sort_attribute_keys()` — **детерминированная сортировка** JSONL-ключей **до** склейки в строку. Тир 1 (10): ядро (`power_kw`, `volume_ml`, …). Тир 2 (20): геометрия (`teeth_count`, `diameter_mm`, …). Тир 3 (30): состав/технологии. Тир 4 (40): визуал (`form_factor`, `color`). Тир 99: прочие. |
+| **`products.attribute_summary`** | Русская строка характеристик для `{attributes}` в шаблоне |
+| **`products.attributes_json`** | Сырой JSONL `attributes` dict — источник для Odoo attribute sync |
+| **`odoo_attribute_sync.py`** | Upsert `product.attribute` / `product.attribute.value`; привязка к `product.template` через `attribute_line_ids`. Маппинг JSONL → Odoo (`power_kw` → «Мощность», `color` → «Цвет», …). **`create_variant: "no_variant"`** — без генерации вариантов SKU. Ошибки атрибутов — `try/except`, **не блокируют** запись имени. |
+| **`template_service.py`** | Категорийные `name_pattern` из `odoo_categories` (TemplateEngine). Smart Auto-Injection **отключена** — только формула шаблона. |
+| **`text_utils.py`** | Golden postprocess, anti-tautology (с сохранением prefix `part_type`), нормализация единиц |
+| **`seed_templates_from_jsonl.py`** | Registry + `CATEGORY_GROUP_OVERRIDES` для смешанных групп (Стартеры, Антикор) |
 
-### 2.3 Data Grid: серверная фильтрация и ошибки sync — DONE
+**Примеры порядка (канарейка):**
+- `06575`: `1000 мл Аэрозоль Черный` → имя `Антигравий 1 л Аэрозоль Черный MASTERWAX`
+- `04966`: `1.2 кВт 11 зубьев` → имя `Стартер для Lada Priora (2170) 1.2 кВт 11 зубьев VALEO`
 
-**`GET /api/products`** — опциональные query-параметры (применяются в SQL **до** `limit`/`offset`):
+**Канареечный тест — подтверждено оператором:**
+- **100% Success** записи **имён** в Odoo UI (`ru_RU`)
+- **100% Success** заполнения вкладки **«Атрибуты и варианты»** нативными `product.attribute`
 
-| Параметр | Назначение |
-|----------|------------|
-| `search` | Case-insensitive `LIKE` по `article`, `external_code`, `generated_name`, кэшированному Odoo-имени |
-| `naming_status` | `no_template` / `pending_sync` / `synced` (SQL-аппроксимация) |
-| `is_locked` | Фильтр по `name_locked` |
-| `has_error` | Только строки с заполненным `last_sync_error` |
+### 2.3 Главный дашборд — DONE
 
-**Поле `products.last_sync_error`** (nullable, patch в `schema_patches.py`):
-- `SyncService` записывает текст ошибки при сбое JSON-RPC / commit; очищает при успешном push.
-- UI: иконка `AlertTriangle` + Tooltip в колонке превью (`CatalogTable.tsx`).
+| Компонент | Назначение |
+|-----------|------------|
+| **`GET /api/metrics/dashboard`** | KPI: `total_products`, `synced`, `pending`, `locked` |
+| **`GET /api/jobs/active`** | Статус/прогресс фоновых ETL-jobs |
+| **`MainDashboard.tsx`** | KPI + Quick Actions + progress bar активных задач |
 
-**Frontend Toolbar:** debounce-поиск **400 мс**, Select-фильтры, `keepPreviousData`, сброс `pageIndex` при смене фильтров.
+### 2.4 Data Grid, Manual Override, Fitment — DONE
 
-**Реализация:** `backend/app/services/catalog_query.py`, `backend/app/api/catalog.py`.
-
-### 2.4 Manual Override (Human-in-the-loop) — DONE
-
-**Бизнес-смысл `name_locked` (уточнён):**
-
-| Контекст | Поведение |
-|----------|-----------|
-| **Enrich / Webhooks / batch generate / fitment persist** | TemplateEngine **не перезаписывает** `generated_name` (`persist_generation_result`, `apply_product_text_fitment`) |
-| **SyncService / mass push / batch sync** | Locked-товар **может и должен** уходить в Odoo, если изменился `source_hash` (ручная правка оператора). Preview **не** вызывается — берётся stored `generated_name`. |
-| **`sync_queue.py`** | Locked-товары **включены** в кандидаты при `synced_at IS NULL` или `generation_status = 'review'` |
-
-**API:** `PATCH /api/products/{product_id}/override`
-- Payload: `{ manual_name?: str, is_locked?: bool }`
-- При lock + `manual_name` → запись в `generated_name`, пересчёт `source_hash` (`compute_sync_content_hash`), `generation_status = 'review'`, `last_sync_error = NULL`.
-
-**UI:** `FitmentEditorSheet.tsx` переименован по смыслу в **«Карточка товара»** — Switch «Ручная фиксация имени (Lock)», Input для ручного имени, optimistic update TanStack Query.
-
-**Сервисы:** `product_override_service.py`, `backend/app/api/product_override.py`.
-
-### 2.5 Локальный кэш и fitment — DONE
-
-| Таблица / поле | Назначение |
-|----------------|------------|
-| **`products`** | PIM-кэш: `generated_name`, `search_keywords`, `source_hash`, `synced_at`, **`last_sync_error`**, `name_locked`, denormalized fitment |
-| **`fitments`**, **`product_fitments`** | Текстовая и directory-применимость для UI |
-| **`odoo_categories`** | 216 категорий; 56 с `name_pattern` |
-
-**Fitment API:**
-- `GET /api/vehicles/makes|models|generations` — mock (`vehicle_directory.py`)
-- `POST /api/products/{product_id}/fitment` — save IDs + regenerate preview (если не locked)
-
-### 2.6 Прочее (без изменений в этой волне)
-
-- **`POST /api/odoo/sync/categories`**, Template Builder (`/templates`), webhooks (`POST /api/webhooks/odoo/product`).
-- **`POST /api/sync/odoo`** — batch push выбранных ID через `SyncService`.
-- **`POST /api/products/batch/generate-name`** — пакетная генерация (skip locked).
+Серверные фильтры, `last_sync_error`, `PATCH /api/products/{id}/override`, `name_locked` semantics, fitment API.
 
 ---
 
-## 3. Golden Rules (не ломать)
+## 3. Golden Rules (не ломать — непреклонно)
 
-1. **Только JSON-RPC** — `execute_kw` через `OdooClient`. **XML-RPC под абсолютным запретом.** Запрещены cookie-сессии, `authenticate`, `/web/session/authenticate`.
-2. **Запись в Odoo ТОЛЬКО через `SyncService`** — push (`POST /api/sync/odoo`, webhooks, `mass_sync_to_odoo.py`, `POST /api/jobs/push-to-odoo`) делегирует в `SyncService.sync_products()`. Прямые `client.write()` вне сервиса — **запрещены**.
-3. **Идемпотентность (`source_hash`)** — перед `write` сравнивать hash; skip только при **неизменном** hash **и** наличии `synced_at`. Изменение hash (в т.ч. после manual override) → товар снова eligible для push.
-4. **`name_locked` — двойная семантика:**
-   - **Блокирует автогенерацию** (TemplateEngine / enrich / webhook persist / fitment persist).
-   - **НЕ блокирует Odoo sync** — ручное имя в `generated_name` отправляется через `SyncService` по тем же правилам `source_hash`.
-5. **`DRY_RUN=true` (default)** — симуляция без HTTP write. Live: `DRY_RUN=false` в `.env` **или** `--force-apply` в CLI.
-6. **`x_search_keywords`** — обязательное поле при push вместе с `name`.
-7. **Генерация имён — pure function** — `generate_naming_result()` без I/O; I/O на границах API/sync/CLI/jobs.
-8. **Без hardcoded UUID** — ID из Odoo cache или env.
-9. **Код EN / UI RU** — комментарии на английском, UI-строки на русском.
-10. **Background jobs** — один экземпляр job-типа за раз (in-memory mutex; при масштабировании на несколько воркеров потребуется Redis/DB lock).
+1. **Только JSON-RPC** — `execute_kw` через `OdooClient`. **XML-RPC под абсолютным запретом.**
+2. **Запись в Odoo ТОЛЬКО через `SyncService`** — push делегирует в `SyncService.sync_products()`.
+3. **Контекст `ru_RU`** — все RPC через `OdooClient` (Translation Context Trap для `product.template.name`).
+4. **Идемпотентность (`source_hash`)** — skip только при неизменном hash **и** `synced_at`, **и** отсутствии более свежего `updated_at`.
+5. **`name_locked`** — блокирует автогенерацию, **не** блокирует Odoo sync stored `generated_name`.
+6. **`DRY_RUN=true` (default)** — симуляция без HTTP write. Live: `DRY_RUN=false` **или** `--force-apply` / canary `force_apply`.
+7. **`x_search_keywords`** — обязательное поле при push вместе с `name` на `product.template`.
+8. **`create_variant: "no_variant"`** — при создании `product.attribute` через NameForge (запрет вариантов на складе).
+9. **Генерация имён — pure function** — `generate_naming_result()` без I/O.
+10. **Код EN / UI RU.**
 
 ---
 
-## 4. Ключевые файлы
+## 4. СЛЕДУЮЩИЙ ФОКУС — старт новой сессии здесь
+
+### ✅ Закрыто в этой сессии (не возвращаться)
+
+| Блокер | Решение |
+|--------|---------|
+| **Data Mismatch (Sync vs Odoo UI)** | `OdooClient._merge_rpc_kwargs()` → `context.lang = ru_RU`; canary Verification Read |
+| **Ugly Naming / хаотичный порядок атрибутов** | `PRIORITY_WEIGHTS` в `attribute_parser.py`; профессиональные `name_pattern` в seed; auto-injection удалена |
+| **Пустая вкладка «Атрибуты и варианты»** | `odoo_attribute_sync.py` → `attribute_line_ids` upsert в `SyncService` |
+
+### 🎯 New Focus (приоритет следующего спринта)
+
+#### 1. SEO-индексация — `x_search_keywords`
+
+- Обогащение поля **`x_search_keywords`**: склейка синонимов, кросс-номеров, «грязных» supplier-строк, альтернативных названий (ПТФ, туманки, …).
+- Цель: ручной поиск оператора в Odoo + совместимость с downstream-пайплайнами.
+- **Не путать** с golden `name` (Rule 2 в `NAMING_TEMPLATES_V2.md` — синонимы **не** в печатное имя).
+
+#### 2. Автоматическое тегирование — `product.tag` / `product_tag_ids`
+
+- Авто-присвоение e-commerce тегов на `product.template` для фильтров витрины.
+- Upsert по аналогии с attribute sync; idempotent write через `SyncService`.
+
+#### 3. HTML-описания — **ОТЛОЖЕНО**
+
+- Генерацию HTML `description_sale` / rich-text описаний **не начинать** в ближайшем спринте.
+- Планируется **позже через LLM** после стабилизации SEO + тегов.
+
+---
+
+## 5. Ключевые файлы (актуальные)
 
 | Область | Путь |
 |---------|------|
-| **Dashboard KPI** | `backend/app/api/routers/metrics.py`, `services/metrics_service.py`, `frontend/.../MainDashboard.tsx` |
-| **Background jobs** | `backend/app/api/routers/jobs.py`, `services/job_tasks.py`, `job_lock.py` |
-| **Catalog filters** | `backend/app/services/catalog_query.py`, `frontend/.../CatalogTable.tsx` |
-| **Manual override** | `backend/app/api/product_override.py`, `services/product_override_service.py`, `FitmentEditorSheet.tsx` |
-| **Sync errors** | `products.last_sync_error`, `sync_service.py` |
-| **ETL services** | `product_catalog_sync.py`, `catalog_jsonl_enrichment.py`, `mass_sync_job.py`, `sync_queue.py` |
-| **Sync (write gate)** | `sync_service.py`, `api/sync.py` |
-| **Fitment** | `fitment.py`, `fitment_service.py`, `HierarchicalFitmentSelect.tsx` |
-| **Naming engine** | `template_service.py` (`compute_sync_content_hash`, `persist_generation_result`) |
-| **Data Grid API client** | `frontend/src/lib/catalog-api.ts`, `metrics-api.ts`, `jobs-api.ts` |
-| **DB patches** | `backend/app/core/schema_patches.py` |
-| **Tests (новые)** | `test_dashboard_metrics.py`, `test_jobs_api.py`, `test_catalog_filters.py`, `test_product_override.py`, `test_sync_queue.py` |
+| **Sync (write gate)** | `sync_service.py`, `odoo_client.py`, `odoo_attribute_sync.py` |
+| **Attribute pipeline** | `attribute_parser.py`, `catalog_jsonl_enrichment.py` |
+| **Naming engine** | `template_service.py`, `text_utils.py` |
+| **Template seed registry** | `scripts/seed_templates_from_jsonl.py` |
+| **Canary E2E** | `scripts/run_canary_test.py` |
+| **Job progress** | `job_progress.py`, `api/routers/jobs.py` |
+| **Dashboard** | `MainDashboard.tsx` |
+| **DB patches** | `schema_patches.py` (`attribute_summary`, `attributes_json`, `last_sync_error`, …) |
+| **Tests** | `test_sync_service.py`, `test_attribute_parser.py`, `test_odoo_attribute_sync.py`, `test_odoo_client.py`, … |
+
+**Референс:** `NAMING_TEMPLATES_V2.md`, `odoo_master_catalog_notebooklm.pdf`.
 
 ---
 
-## 5. Проверки качества (baseline)
+## 6. Проверки качества (baseline)
 
 ```bash
 ruff check .
-pytest                    # 146+ tests green
+pytest                    # 182 tests green (на момент handoff)
 cd frontend && npm run build
 ```
 
----
-
-## 6. Следующая цель — Live Job Progress (New Focus)
-
-**Задача:** мониторинг **прогресса выполнения фоновых ETL-задач** в UI дашборда (сейчас jobs fire-and-forget: `202` + toast, без статуса выполнения).
-
-**Ожидаемый scope (черновик):**
-- Backend: job state store (in-memory → позже SQLite/Redis): `status`, `started_at`, `finished_at`, `progress` (processed/total), `error`, `stats`.
-- `GET /api/jobs/status` или SSE/WebSocket для live updates.
-- UI на Main Dashboard: индикатор «идёт импорт / enrich / push», progress bar, последний результат; блокировка повторного запуска уже есть (`409`).
-- Не ломать mutex и изолированные DB-сессии в runners.
-
-**Не начинать без:** выбора transport (polling vs SSE) и решения, переживает ли job-state рестарт uvicorn (in-memory vs persistent).
+**Canary regression (5 SKU):**
+```bash
+python scripts/run_canary_test.py
+# Ожидание: Success × 5; attribute_summary в правильном порядке; Odoo UI = Verification Read
+```
 
 ---
 
 ## 7. Открытые моменты / риски
 
-- Legacy **Streamlit + МойСклад** (`src/`, `pages/`) параллельно с 2.0 — не смешивать write-path.
-- **In-memory job lock** — не работает при нескольких uvicorn workers; для prod нужен distributed lock.
-- **115 категорий** без auto-seed формулы — донастройка в `/templates`.
-- **Mock vehicle directory** — замена на Base-Auto отдельным спринтом.
-- **`naming_status` SQL-фильтр** — аппроксимация; в редких случаях может расходиться с badge после live-enrichment.
-- `DRY_RUN=true` в `.env` — mass push / job «Массовая отправка» не пишет в Odoo без `DRY_RUN=false` или CLI `--force-apply`.
-- **`data/odoo_master_catalog.jsonl`** обязателен для job enrich (не в Git).
+- Legacy **Streamlit + МойСклад** параллельно с 2.0 — не смешивать write-path.
+- **In-memory job lock / job progress** — не переживают рестарт uvicorn.
+- **`seed_templates_from_jsonl.py --apply`** нужен после обновления registry (категории без `name_pattern` → fallback на SQL `templates`).
+- **`data/odoo_master_catalog.jsonl`** обязателен для enrich (не в Git).
+- **`DRY_RUN=true`** по умолчанию — mass push без `--force-apply` не пишет в Odoo.
+- **Attribute upsert** создаёт глобальные `product.attribute` в Odoo — нужна политика именования и периодический аудит дублей.
 
 ---
 
-*Handoff актуален на конец сессии: Main Dashboard + KPI, Background Jobs API, серверная фильтрация каталога, sync error logging, Manual Override (`name_locked` + PATCH override). Следующий фокус — **Live Job Progress** в дашборде.*
+*Handoff актуален на конец сессии: Priority Weights, native Odoo attributes (`no_variant`), ru_RU RPC context, canary 100% green (имена + атрибуты в UI). **Следующий фокус — SEO (`x_search_keywords`) и auto-tagging (`product.tag`); HTML-описания через LLM — отложены.***

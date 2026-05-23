@@ -16,6 +16,9 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Odoo writes translatable fields (e.g. product.template.name) into the active lang.
+DEFAULT_ODOO_RPC_LANG = "ru_RU"
+
 
 class OdooClientError(RuntimeError):
     """Raised when Odoo configuration or JSON-RPC calls fail."""
@@ -57,6 +60,19 @@ class OdooClient:
                 "Odoo API secret is empty; set ODOO_API_KEY or ODOO_PASSWORD in .env"
             )
 
+    def _merge_rpc_kwargs(self, kwargs: dict[str, Any] | None) -> dict[str, Any]:
+        """Ensure every ``execute_kw`` call uses the operator UI language (``ru_RU``)."""
+        merged = dict(kwargs or {})
+        ctx = dict(merged.get("context") or {})
+        ctx["lang"] = DEFAULT_ODOO_RPC_LANG
+        merged["context"] = ctx
+        return merged
+
+    @property
+    def database(self) -> str:
+        """Connected Odoo database name (``ODOO_DB``)."""
+        return self._db
+
     def call(
         self,
         model: str,
@@ -66,7 +82,13 @@ class OdooClient:
     ) -> Any:
         """Invoke ``execute_kw`` on ``model`` with positional ``args`` and keyword ``kwargs``."""
         self._rpc_id += 1
-        payload = self._build_payload(self._rpc_id, model, method, args, kwargs)
+        payload = self._build_payload(
+            self._rpc_id,
+            model,
+            method,
+            args,
+            self._merge_rpc_kwargs(kwargs),
+        )
         try:
             http = self._session.post(self._url, json=payload, timeout=self._timeout)
             http.raise_for_status()
@@ -123,31 +145,17 @@ class OdooClient:
 
     def batch_write(self, model: str, updates: list[tuple[list[int], dict[str, Any]]]) -> list[Any]:
         """
-        Execute multiple ``write`` calls in a single HTTP request using JSON-RPC batching.
-        
-        :param updates: List of (ids, values) tuples.
+        Execute sequential ``write`` calls (one JSON-RPC request per record).
+
+        Odoo deployments often reject HTTP JSON-RPC batch arrays with HTTP 400.
         """
         if not updates:
             return []
 
-        payloads = []
+        results: list[Any] = []
         for ids, values in updates:
-            self._rpc_id += 1
-            payloads.append(self._build_payload(self._rpc_id, model, "write", [ids, values]))
-
-        try:
-            http = self._session.post(self._url, json=payloads, timeout=self._timeout)
-            http.raise_for_status()
-            responses = http.json()
-        except requests.RequestException as exc:
-            logger.error("Odoo network error during batch: %s", exc)
-            raise OdooClientError(f"Odoo network error during batch: {exc}") from exc
-
-        if not isinstance(responses, list):
-            # If server doesn't support batching, it might return a single error object
-            return [self._parse_response(responses)]
-
-        return [self._parse_response(resp) for resp in responses]
+            results.append(self.write(model, ids, values))
+        return results
 
     def execute_kw(
         self,
@@ -182,6 +190,35 @@ class OdooClient:
         if not isinstance(out, list):
             raise OdooClientError(f"Unexpected search_read payload type: {type(out)!r}")
         return out
+
+    def search(
+        self,
+        model: str,
+        domain: list[Any],
+        *,
+        limit: int = 0,
+        order: str | None = None,
+    ) -> list[int]:
+        """ORM ``search`` — returns record ids."""
+        kw: dict[str, Any] = {}
+        if limit:
+            kw["limit"] = limit
+        if order:
+            kw["order"] = order
+        out = self.call(model, "search", [domain], kw)
+        if not out:
+            return []
+        if not isinstance(out, list):
+            raise OdooClientError(f"Unexpected search payload type: {type(out)!r}")
+        return [int(item) for item in out]
+
+    def create(self, model: str, values: dict[str, Any]) -> int:
+        """ORM ``create`` — returns new record id."""
+        out = self.call(model, "create", [values])
+        try:
+            return int(out)
+        except (TypeError, ValueError) as exc:
+            raise OdooClientError(f"Unexpected create payload: {out!r}") from exc
 
     def write(self, model: str, ids: list[int], values: dict[str, Any]) -> Any:
         """ORM ``write`` for one batch of records."""

@@ -66,6 +66,10 @@ class ProductNamingInput(BaseModel):
         default_factory=list,
         description="Доп. характеристики для названия (порядок сохраняется).",
     )
+    attributes_summary: str = Field(
+        default="",
+        description="Formatted JSONL attributes line for {attributes}/{characteristics}.",
+    )
     supplier_raw_name: str | None = Field(
         default=None,
         description="Сырой текст названия от поставщика (только для search_keywords).",

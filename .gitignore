@@ -18,6 +18,7 @@ __pycache__/
 # Odoo catalog exports (real product data — keep local only)
 data/odoo_master_catalog.jsonl
 data/odoo_master_catalog.xlsx
+data/odoo_master_catalog*.pdf
 
 logs/
 analysis_output.json

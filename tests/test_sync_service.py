@@ -80,9 +80,11 @@ def mock_session() -> MagicMock:
     return session
 
 
+@patch("app.services.sync_service.merge_product_attributes_into_write_values")
 @patch("app.services.sync_service.generate_preview_for_product")
 def test_sync_dry_run_does_not_call_odoo(
     mock_preview: MagicMock,
+    mock_attrs: MagicMock,
     mock_session: MagicMock,
     mock_client: MagicMock,
 ) -> None:
@@ -118,7 +120,7 @@ def test_sync_locked_product_uses_stored_name_without_preview(
     result = service.sync_products([1])
 
     mock_preview.assert_not_called()
-    mock_client.batch_write.assert_called_once()
+    mock_client.write.assert_called_once()
     assert result.pushed == 1
     assert result.skipped_locked == 0
     assert 1 in result.synced_product_ids
@@ -154,6 +156,7 @@ def test_sync_idempotent_skips_when_hash_unchanged_and_synced(
     mock_client: MagicMock,
 ) -> None:
     product = _product(source_hash=_HASH_OLD, synced_at="2026-01-01T00:00:00+00:00")
+    product.updated_at = "2025-12-31T00:00:00+00:00"
     mock_session.query.return_value.filter.return_value.all.return_value = [product]
     mock_preview.return_value = (
         _preview_result(source_hash=_HASH_OLD),
@@ -169,8 +172,32 @@ def test_sync_idempotent_skips_when_hash_unchanged_and_synced(
 
 
 @patch("app.services.sync_service.generate_preview_for_product")
-def test_sync_live_calls_batch_write_when_hash_changed(
+def test_sync_repushes_when_product_updated_after_last_sync(
     mock_preview: MagicMock,
+    mock_session: MagicMock,
+    mock_client: MagicMock,
+) -> None:
+    product = _product(source_hash=_HASH_OLD, synced_at="2026-01-01T00:00:00+00:00")
+    product.updated_at = "2026-01-02T00:00:00+00:00"
+    mock_session.query.return_value.filter.return_value.all.return_value = [product]
+    mock_preview.return_value = (
+        _preview_result(source_hash=_HASH_OLD),
+        _resolution(),
+    )
+
+    service = SyncService(mock_session, mock_client, dry_run=False)
+    result = service.sync_products([1])
+
+    mock_client.write.assert_called_once()
+    assert result.pushed == 1
+    assert result.skipped_idempotent == 0
+
+
+@patch("app.services.sync_service.merge_product_attributes_into_write_values")
+@patch("app.services.sync_service.generate_preview_for_product")
+def test_sync_live_calls_write_when_hash_changed(
+    mock_preview: MagicMock,
+    mock_attrs: MagicMock,
     mock_session: MagicMock,
     mock_client: MagicMock,
 ) -> None:
@@ -185,7 +212,8 @@ def test_sync_live_calls_batch_write_when_hash_changed(
     service = SyncService(mock_session, mock_client, dry_run=False)
     result = service.sync_products([1])
 
-    mock_client.batch_write.assert_called_once()
+    mock_client.write.assert_called_once()
+    mock_attrs.assert_called_once()
     assert result.pushed == 1
     assert 1 in result.synced_product_ids
     assert product.last_sync_error is None
@@ -209,10 +237,43 @@ def test_sync_persists_last_sync_error_on_odoo_failure(
         _resolution(),
     )
     mock_client.batch_write.side_effect = OdooClientError("RPC denied")
+    mock_client.write.side_effect = OdooClientError("RPC denied")
 
     service = SyncService(mock_session, mock_client, dry_run=False)
     result = service.sync_products([1])
 
     assert result.errors == 1
     assert product.last_sync_error == "RPC denied"
+    mock_client.write.assert_called_once()
     mock_session.commit.assert_called()
+
+
+@patch("app.services.sync_service.generate_preview_for_product")
+def test_sync_continues_after_single_write_failure(
+    mock_preview: MagicMock,
+    mock_session: MagicMock,
+    mock_client: MagicMock,
+) -> None:
+    from app.services.odoo_client import OdooClientError
+
+    first = _product(pid=1, source_hash=_HASH_OLD, synced_at=None, odoo_product_id="10")
+    second = _product(pid=2, source_hash=_HASH_OLD, synced_at=None, odoo_product_id="11")
+    mock_session.query.return_value.filter.return_value.all.return_value = [first, second]
+    mock_session.get.side_effect = lambda _model, pid: first if pid == 1 else second
+    mock_preview.return_value = (_preview_result(source_hash=_HASH_NEW), _resolution())
+
+    def write_side_effect(model, ids, values):
+        if ids == [10]:
+            raise OdooClientError("first failed")
+        return True
+
+    mock_client.write.side_effect = write_side_effect
+
+    service = SyncService(mock_session, mock_client, dry_run=False)
+    result = service.sync_products([1, 2])
+
+    assert mock_client.write.call_count == 2
+    assert result.pushed == 1
+    assert result.errors == 1
+    assert 2 in result.synced_product_ids
+    assert first.last_sync_error == "first failed"

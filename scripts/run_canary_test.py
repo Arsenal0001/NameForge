@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Canary E2E pipeline: extract 5 SKUs from Odoo → JSONL enrich → live push via SyncService.
+Canary E2E pipeline: extract 5 SKUs from Odoo -> JSONL enrich -> live push via SyncService.
 
 Run from project root:
     python scripts/run_canary_test.py
@@ -20,7 +20,7 @@ if str(_ROOT) not in sys.path:
     sys.path.append(str(_ROOT))
 
 # Replace with real default_code values before running against production Odoo.
-TARGET_CODES = ["CODE1", "CODE2", "CODE3", "CODE4", "CODE5"]
+TARGET_CODES = ["04966", "06575", "11064", "17128", "16300"]
 
 import src.db as legacy_db  # noqa: E402
 from app.core.config import settings  # noqa: E402
@@ -63,6 +63,8 @@ class CanaryProductState:
     product_id: int | None = None
     original_odoo_name: str = ""
     generated_name: str = ""
+    attribute_summary: str = ""
+    odoo_verified_name: str = ""
     sync_status: str = "Pending"
     error_log: str = ""
     enrich_warnings: list[str] = field(default_factory=list)
@@ -269,6 +271,15 @@ def load_target_products(
     if not product_ids:
         return
 
+    # Canary always re-pushes after enrich so we can verify Odoo persistence.
+    for state in states.values():
+        if state.product_id is None:
+            continue
+        product = session.get(Product, state.product_id)
+        if product is None:
+            continue
+        product.synced_at = None
+
     dry_run = False if force_apply else settings.DRY_RUN
     if force_apply and settings.DRY_RUN:
         Console().print(
@@ -303,6 +314,45 @@ def load_target_products(
                 state.error_log = f"{detail}; enrich: {', '.join(state.enrich_warnings)}"
 
 
+def verify_odoo_names(
+    client: OdooClient,
+    states: dict[str, CanaryProductState],
+    *,
+    console: Console,
+) -> None:
+    """Post-write verification read: confirm Odoo persisted the pushed name."""
+    for code in TARGET_CODES:
+        state = states.get(code.strip())
+        if state is None or state.sync_status != "Success":
+            continue
+
+        try:
+            row = client.get_product_template_by_default_code(
+                state.default_code,
+                fields=["id", "name", "default_code"],
+            )
+        except OdooClientError as exc:
+            state.odoo_verified_name = f"read_error: {exc}"
+            console.print(
+                f"[red]VERIFY[/red] {state.default_code}: Odoo read failed — {exc}",
+            )
+            continue
+
+        if row is None:
+            state.odoo_verified_name = "not_found"
+            console.print(
+                f"[red]VERIFY[/red] {state.default_code}: product.template not found",
+            )
+            continue
+
+        verified_name = _text(row.get("name"))
+        state.odoo_verified_name = verified_name
+        console.print(
+            f"[cyan]VERIFY[/cyan] {state.default_code}: "
+            f"Odoo name = {verified_name!r}",
+        )
+
+
 def _refresh_generated_names(session, states: dict[str, CanaryProductState]) -> None:
     for state in states.values():
         if state.product_id is None:
@@ -312,6 +362,7 @@ def _refresh_generated_names(session, states: dict[str, CanaryProductState]) -> 
             continue
         preview, _resolution = generate_preview_for_product(session, product)
         state.generated_name = (product.generated_name or "").strip()
+        state.attribute_summary = (product.attribute_summary or "").strip()
         if not state.generated_name and preview is not None:
             state.generated_name = (preview.name or "").strip()
         if preview is not None and "brand_skipped" in preview.warnings:
@@ -324,6 +375,8 @@ def render_report(states: dict[str, CanaryProductState]) -> None:
     table.add_column("Код (default_code)", style="cyan", no_wrap=True)
     table.add_column("Оригинальное имя (Odoo)", overflow="fold")
     table.add_column("Новое сгенерированное имя", overflow="fold")
+    table.add_column("attribute_summary (порядок)", overflow="fold")
+    table.add_column("Имя после проверки в Odoo", overflow="fold", style="bold")
     table.add_column("Статус отправки", justify="center")
     table.add_column("Лог ошибки (если есть)", overflow="fold", style="red")
 
@@ -334,8 +387,10 @@ def render_report(states: dict[str, CanaryProductState]) -> None:
         status_style = "green" if state.sync_status == "Success" else "red"
         table.add_row(
             state.default_code,
-            state.original_odoo_name or "—",
-            state.generated_name or "—",
+            state.original_odoo_name or "-",
+            state.generated_name or "-",
+            state.attribute_summary or "-",
+            state.odoo_verified_name or "-",
             f"[{status_style}]{state.sync_status}[/{status_style}]",
             state.error_log or "",
         )
@@ -371,14 +426,19 @@ def main() -> int:
     if not ok:
         console.print(f"[red]ERROR:[/red] Odoo connection failed: {message}")
         return 1
+    console.print(
+        f"[bold]Odoo target DB:[/bold] {client.database!r} "
+        f"(сверьте с базой в браузере; settings.ODOO_DB={settings.ODOO_DB!r})",
+    )
     console.print(f"[green]Connected[/green] to Odoo as: {message}")
 
     db = SessionLocal()
     try:
-        console.print("[bold]Step 1/3[/bold] Extract from Odoo → local DB …")
+        console.print("[bold]Step 1/3[/bold] Extract from Odoo -> local DB ...")
         extract_target_products(db, client, target_codes, states)
 
-        console.print("[bold]Step 2/3[/bold] Transform via JSONL enrichment …")
+        console.print("[bold]Step 2/3[/bold] Transform via JSONL enrichment ...")
+        get_template_engine().invalidate_cache()
         stats = enrich_target_products(db, jsonl_path, target_codes, states)
         _refresh_generated_names(db, states)
         console.print(
@@ -387,8 +447,9 @@ def main() -> int:
             f"errors: {stats.generation_errors}",
         )
 
-        console.print("[bold]Step 3/3[/bold] Load to Odoo (force_apply, live write) …")
+        console.print("[bold]Step 3/3[/bold] Load to Odoo (force_apply, live write) ...")
         load_target_products(db, client, states, force_apply=True)
+        verify_odoo_names(client, states, console=console)
         _refresh_generated_names(db, states)
     except OdooClientError as exc:
         console.print(f"[red]ERROR:[/red] Canary pipeline failed: {exc}")

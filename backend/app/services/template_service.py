@@ -6,7 +6,7 @@ Golden Catalog cleanup (``NAMING_TEMPLATES_V2.md``) lives in :mod:`app.services.
 
 Supported ``name_pattern`` placeholders (safe empty if missing):
 ``part_type``, ``installation``, ``brand``, ``article`` / ``article_primary``,
-``fitment_core``, ``characteristics``, ``make``, ``model``, ``body``, ``years``,
+``fitment_core``, ``characteristics``, ``attributes``, ``make``, ``model``, ``body``, ``years``,
 ``engine``, ``side``, ``cross_numbers``, ``article_cross``, ``dlya_segment``.
 
 - Follows ``04_generation`` rules: primary fitment in description; ``для`` only with make+model;
@@ -39,7 +39,6 @@ from app.models.template import Template
 from app.services.category_template_binding import (
     iter_categories_for_product,
     physical_keys_for_product_matrix,
-    resolve_logical_matrix_id,
 )
 from app.services.text_utils import (
     apply_golden_name_postprocess,
@@ -75,11 +74,12 @@ SKIP_BRANDS: frozenset[str] = STUB_VALUES
 _VAZ_MODEL_RE = re.compile(r"^\d{4,5}$")
 
 _DEFAULT_FITMENT_FALLBACK = (
-    "{part_type} {installation} {fitment_core} {characteristics} {brand}"
+    "{part_type} {installation} {fitment_core} {attributes} {brand}"
 )
 _DEFAULT_UNIVERSAL_FALLBACK = (
-    "{part_type} {installation} {characteristics} {brand}"
+    "{part_type} {installation} {attributes} {brand}"
 )
+
 
 
 def format_years(year_from: int | None, year_to: int | None) -> str:
@@ -239,6 +239,9 @@ def compute_source_hash(
     parts = [p.strip() for p in characteristic_parts if _str(p)]
     if parts:
         payload["characteristic_parts"] = "|".join(parts)
+    attr_summary = scalar(product.get("attributes_summary"))
+    if attr_summary:
+        payload["attributes_summary"] = attr_summary
 
     canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -676,6 +679,7 @@ def product_from_orm(
     else:
         appl = "universal"
     parts = list(characteristic_parts) if characteristic_parts is not None else []
+    attr_summary = _str(getattr(p, "attribute_summary", None))
     return ProductNamingInput(
         part_type=p.part_type,
         brand=p.brand,
@@ -693,6 +697,7 @@ def product_from_orm(
         engine=p.engine,
         installation_location=installation_location,
         characteristic_parts=parts,
+        attributes_summary=attr_summary,
         supplier_raw_name=p.supplier_raw_name,
     )
 
@@ -714,6 +719,7 @@ def product_input_to_hash_dict(inp: ProductNamingInput) -> dict[str, Any]:
         "year_to": inp.year_to,
         "engine": inp.engine,
         "supplier_raw_name": inp.supplier_raw_name,
+        "attributes_summary": inp.attributes_summary,
     }
 
 
@@ -771,14 +777,17 @@ def build_fitment_core_phrase(inp: ProductNamingInput, primary: FitmentNamingInp
 
 def build_characteristics_segment(inp: ProductNamingInput) -> str:
     chunks: list[str] = []
+    attr_summary = sanitize_token_value(_str(inp.attributes_summary))
+    if attr_summary:
+        chunks.append(attr_summary)
+
     side = sanitize_token_value(_str(inp.side_axis))
     if side and not side_already_in_part_type(inp.part_type, side):
         chunks.append(side)
-    chunks.extend(
-        sanitized
-        for part in inp.characteristic_parts
-        if (sanitized := sanitize_token_value(_str(part)))
-    )
+    for part in inp.characteristic_parts:
+        sanitized = sanitize_token_value(_str(part))
+        if sanitized and sanitized not in chunks:
+            chunks.append(sanitized)
     return " ".join(chunks).strip()
 
 
@@ -790,9 +799,27 @@ def build_format_tokens(
     article_primary: str,
     article_cross: list[str],
 ) -> dict[str, str]:
+    attr_line = sanitize_token_value(_str(inp.attributes_summary))
+    side = sanitize_token_value(_str(inp.side_axis))
+    side_chunk = (
+        side
+        if side and not side_already_in_part_type(inp.part_type, side)
+        else ""
+    )
+    extra_parts = [
+        sanitized
+        for part in inp.characteristic_parts
+        if (sanitized := sanitize_token_value(_str(part)))
+        and sanitized != attr_line
+    ]
+    legacy_chars = " ".join(p for p in (side_chunk, *extra_parts) if p).strip()
+    if attr_line and legacy_chars:
+        characteristics = _polish_generated_name(f"{legacy_chars} {attr_line}")
+    else:
+        characteristics = attr_line or legacy_chars
+
     brand_val = "" if brand_skipped else sanitize_token_value(_str(inp.brand))
     installation = sanitize_token_value(_str(inp.installation_location))
-    chars = build_characteristics_segment(inp)
     fit_core = build_fitment_core_phrase(inp, primary)
 
     make_t = model_t = body_t = years_t = engine_t = ""
@@ -840,7 +867,8 @@ def build_format_tokens(
         "article_primary": sanitize_token_value(article_primary),
         "article": sanitize_token_value(article_primary),
         "installation": installation,
-        "characteristics": chars,
+        "characteristics": characteristics,
+        "attributes": attr_line,
         "fitment_core": fit_core,
         "make": make_t,
         "model": model_t,
@@ -960,10 +988,17 @@ def generate_naming_result(
     )
 
     chosen_pattern = pattern
+    active_pattern = ""
     if chosen_pattern and chosen_pattern.strip():
-        raw_name = render_name_pattern(chosen_pattern.strip(), tokens)
+        active_pattern = chosen_pattern.strip()
+        raw_name = render_name_pattern(active_pattern, tokens)
     else:
         chosen_pattern = None
+        active_pattern = (
+            _DEFAULT_FITMENT_FALLBACK
+            if inp.applicability_type == "fitment"
+            else _DEFAULT_UNIVERSAL_FALLBACK
+        )
         raw_name = render_with_fallback_structure(inp, tokens)
 
     raw_name = _polish_generated_name(raw_name)
@@ -1179,10 +1214,26 @@ def generate_for_loaded_product(
     fit_orm = sorted(product.fitments, key=lambda f: (f.sort_order, f.id))
     fit_inputs = fitments_from_orm(fit_orm)
 
-    if _str(product.applicability_type).lower() == "fitment" and not fit_inputs:
-        raise NamingValidationError(
-            "Для fitment-товаров нужна хотя бы одна строка применяемости"
-        )
+    appl = _str(product.applicability_type).lower()
+    if appl == "fitment" and not fit_inputs:
+        mk = _str(product.primary_make)
+        md = _str(product.primary_model)
+        if mk or md:
+            fit_inputs = [
+                FitmentNamingInput(
+                    make=mk,
+                    model=md,
+                    body=product.primary_body,
+                    year_from=product.year_from,
+                    year_to=product.year_to,
+                    engine=product.engine,
+                    is_primary=True,
+                )
+            ]
+        else:
+            raise NamingValidationError(
+                "Для fitment-товаров нужна хотя бы одна строка применяемости"
+            )
 
     primary = select_primary_fitment(product.applicability_type, fit_inputs)
 
@@ -1192,29 +1243,21 @@ def generate_for_loaded_product(
         installation_location=installation_location,
     )
 
-    logical_matrix = resolve_logical_matrix_id(session, product)
-    if logical_matrix:
-        phys = physical_keys_for_product_matrix(
-            session,
-            logical_matrix_id=logical_matrix,
-            applicability_type=inp.applicability_type,
+    eng = get_template_engine()
+    resolution = eng.resolve_for_product(session, product)
+    if resolution.template_key and resolution.template_version:
+        inp = inp.model_copy(
+            update={
+                "template_key": resolution.template_key,
+                "template_version": resolution.template_version,
+            }
         )
-        if phys:
-            tk, tv = phys
-            inp = inp.model_copy(update={"template_key": tk, "template_version": tv})
-
-    pattern = resolve_active_template_pattern(
-        session,
-        template_key=inp.template_key or None,
-        applicability_type=inp.applicability_type,
-        part_type=inp.part_type or None,
-    )
 
     result = generate_naming_result(
-        pattern=pattern,
+        pattern=resolution.name_pattern,
         inp=inp,
-        fitments=fit_inputs,
-        primary=primary,
+        fitments=fit_inputs if appl == "fitment" else [],
+        primary=primary if appl == "fitment" else None,
     )
     if export_dir is not None:
         export_naming_result(result, product_id=product.id, directory=export_dir)

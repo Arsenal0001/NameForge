@@ -26,12 +26,60 @@ def client() -> OdooClient:
 
 
 def test_build_payload_shape(client: OdooClient) -> None:
-    payload = client._build_payload(1, "product.template", "search_read", [[]], {"limit": 1})
+    kwargs = client._merge_rpc_kwargs({"limit": 1})
+    payload = client._build_payload(1, "product.template", "search_read", [[]], kwargs)
     args = payload["params"]["args"]
     assert args[0] == "test_db"
     assert args[1] == 5
     assert args[3] == "product.template"
     assert args[4] == "search_read"
+    assert args[6] == {"limit": 1, "context": {"lang": "ru_RU"}}
+
+
+def test_call_injects_ru_ru_context(client: OdooClient) -> None:
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"jsonrpc": "2.0", "id": 1, "result": True}
+    mock_resp.raise_for_status = MagicMock()
+
+    with patch.object(client._session, "post", return_value=mock_resp) as post:
+        client.write("product.template", [42], {"name": "Test Name"})
+
+    rpc_kwargs = post.call_args.kwargs["json"]["params"]["args"][6]
+    assert rpc_kwargs["context"]["lang"] == "ru_RU"
+
+
+def test_call_forces_ru_ru_even_when_other_lang_requested(client: OdooClient) -> None:
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"jsonrpc": "2.0", "id": 1, "result": True}
+    mock_resp.raise_for_status = MagicMock()
+
+    with patch.object(client._session, "post", return_value=mock_resp) as post:
+        client.call(
+            "product.template",
+            "write",
+            [[42], {"name": "Test Name"}],
+            {"context": {"lang": "en_US"}},
+        )
+
+    rpc_kwargs = post.call_args.kwargs["json"]["params"]["args"][6]
+    assert rpc_kwargs["context"]["lang"] == "ru_RU"
+
+
+def test_call_preserves_existing_context_keys(client: OdooClient) -> None:
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"jsonrpc": "2.0", "id": 1, "result": []}
+    mock_resp.raise_for_status = MagicMock()
+
+    with patch.object(client._session, "post", return_value=mock_resp) as post:
+        client.call(
+            "product.template",
+            "search_read",
+            [[]],
+            {"fields": ["name"], "context": {"active_test": False}},
+        )
+
+    rpc_kwargs = post.call_args.kwargs["json"]["params"]["args"][6]
+    assert rpc_kwargs["context"] == {"active_test": False, "lang": "ru_RU"}
 
 
 def test_call_parses_result(client: OdooClient) -> None:

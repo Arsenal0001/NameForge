@@ -39,10 +39,14 @@ def apply_schema_patches(engine: Engine) -> None:
         _patch_sqlite_odoo_categories(engine)
         _patch_sqlite_products_search_keywords(engine)
         _patch_sqlite_products_last_sync_error(engine)
+        _patch_sqlite_products_attribute_summary(engine)
+        _patch_sqlite_products_attributes_json(engine)
     elif dialect == "postgresql":
         _patch_postgres_odoo_categories(engine)
         _patch_postgres_products_search_keywords(engine)
         _patch_postgres_products_last_sync_error(engine)
+        _patch_postgres_products_attribute_summary(engine)
+        _patch_postgres_products_attributes_json(engine)
     else:
         logger.warning("Schema patches: unsupported dialect %s", dialect)
 
@@ -137,6 +141,42 @@ def _patch_sqlite_products_last_sync_error(engine: Engine) -> None:
             logger.info("Migration: products.last_sync_error added")
 
 
+def _patch_sqlite_products_attribute_summary(engine: Engine) -> None:
+    with engine.begin() as conn:
+        exists = conn.execute(
+            text(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='products'"
+            )
+        ).scalar()
+        if not exists:
+            return
+        rows = conn.execute(text("PRAGMA table_info(products)")).fetchall()
+        cols = {r[1] for r in rows}
+        if "attribute_summary" not in cols:
+            conn.execute(
+                text("ALTER TABLE products ADD COLUMN attribute_summary TEXT")
+            )
+            logger.info("Migration: products.attribute_summary added")
+
+
+def _patch_sqlite_products_attributes_json(engine: Engine) -> None:
+    with engine.begin() as conn:
+        exists = conn.execute(
+            text(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='products'"
+            )
+        ).scalar()
+        if not exists:
+            return
+        rows = conn.execute(text("PRAGMA table_info(products)")).fetchall()
+        cols = {r[1] for r in rows}
+        if "attributes_json" not in cols:
+            conn.execute(
+                text("ALTER TABLE products ADD COLUMN attributes_json TEXT")
+            )
+            logger.info("Migration: products.attributes_json added")
+
+
 def _patch_postgres_products_search_keywords(engine: Engine) -> None:
     try:
         insp = inspect(engine)
@@ -167,3 +207,35 @@ def _patch_postgres_products_last_sync_error(engine: Engine) -> None:
             logger.info("Migration: products.last_sync_error added")
     except Exception as exc:
         logger.warning("Postgres products.last_sync_error patch skipped: %s", exc)
+
+
+def _patch_postgres_products_attribute_summary(engine: Engine) -> None:
+    try:
+        insp = inspect(engine)
+        if not insp.has_table("products"):
+            return
+        cols = {c["name"] for c in insp.get_columns("products")}
+        if "attribute_summary" not in cols:
+            with engine.begin() as conn:
+                conn.execute(
+                    text("ALTER TABLE products ADD COLUMN attribute_summary TEXT")
+                )
+            logger.info("Migration: products.attribute_summary added")
+    except Exception as exc:
+        logger.warning("Postgres products.attribute_summary patch skipped: %s", exc)
+
+
+def _patch_postgres_products_attributes_json(engine: Engine) -> None:
+    try:
+        insp = inspect(engine)
+        if not insp.has_table("products"):
+            return
+        cols = {c["name"] for c in insp.get_columns("products")}
+        if "attributes_json" not in cols:
+            with engine.begin() as conn:
+                conn.execute(
+                    text("ALTER TABLE products ADD COLUMN attributes_json TEXT")
+                )
+            logger.info("Migration: products.attributes_json added")
+    except Exception as exc:
+        logger.warning("Postgres products.attributes_json patch skipped: %s", exc)

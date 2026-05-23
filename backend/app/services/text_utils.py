@@ -165,6 +165,39 @@ def _strip_edge_punct(token: str) -> str:
     return token.strip(".,;:!?\"'«»()[]")
 
 
+_MEASUREMENT_TOKEN_RE = re.compile(
+    r"^(?:\d+(?:[.,]\d+)?)(?:мл|ml|л|l|квт|kw|в|v|ач|ah|мм|mm)?$",
+    re.IGNORECASE,
+)
+_UNIT_WORDS: frozenset[str] = frozenset(
+    {
+        "мл",
+        "ml",
+        "л",
+        "l",
+        "квт",
+        "kw",
+        "в",
+        "v",
+        "ач",
+        "ah",
+        "мм",
+        "mm",
+        "зубьев",
+        "зуб",
+    }
+)
+
+
+def _is_protected_measurement_token(raw_token: str) -> bool:
+    core = _strip_edge_punct(raw_token).casefold()
+    if not core:
+        return False
+    if core in _UNIT_WORDS:
+        return True
+    return _MEASUREMENT_TOKEN_RE.match(core) is not None
+
+
 def dedupe_consecutive_words(text: str) -> str:
     words = text.split()
     if not words:
@@ -186,22 +219,43 @@ def _token_matches_whole_word_in(haystack_cf: str, token_cf: str) -> bool:
     )
 
 
+def _drop_tokens_subsumed_in_part_type(text: str, part_type_cf: str) -> str:
+    if len(part_type_cf) < 3 or not text:
+        return text
+    kept: list[str] = []
+    for raw_t in text.split():
+        if _is_protected_measurement_token(raw_t):
+            kept.append(raw_t)
+            continue
+        t = _strip_edge_punct(raw_t).casefold()
+        if len(t) >= 3 and t != part_type_cf and _token_matches_whole_word_in(part_type_cf, t):
+            continue
+        kept.append(raw_t)
+    return " ".join(kept)
+
+
 def remove_words_subsumed_in_part_type(text: str, part_type: str) -> str:
     """
     Drop name tokens that duplicate a whole word already present in ``part_type``.
 
     Uses strict word boundaries so e.g. «ток» inside «сток» does not match.
+    Preserves the leading ``part_type`` phrase when the name starts with it.
     """
-    pt = (part_type or "").casefold().strip()
-    if len(pt) < 3 or not text:
+    pt = (part_type or "").strip()
+    pt_cf = pt.casefold()
+    if len(pt_cf) < 3 or not text:
         return text
-    kept: list[str] = []
-    for raw_t in text.split():
-        t = _strip_edge_punct(raw_t).casefold()
-        if len(t) >= 3 and t != pt and _token_matches_whole_word_in(pt, t):
-            continue
-        kept.append(raw_t)
-    return " ".join(kept)
+
+    name = text.strip()
+    if name.casefold().startswith(pt_cf):
+        prefix = name[: len(pt)].strip()
+        suffix = name[len(pt) :].strip()
+        if not suffix:
+            return prefix
+        cleaned_suffix = _drop_tokens_subsumed_in_part_type(suffix, pt_cf)
+        return f"{prefix} {cleaned_suffix}".strip() if cleaned_suffix else prefix
+
+    return _drop_tokens_subsumed_in_part_type(name, pt_cf)
 
 
 def strip_article_tokens_from_name(name: str, article_primary: str) -> str:

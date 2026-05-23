@@ -24,8 +24,8 @@ NAMING_MATRIX_DEFINITIONS: tuple[tuple[str, str, str], ...] = (
 LOGICAL_MATRIX_IDS: frozenset[str] = frozenset(m[0] for m in NAMING_MATRIX_DEFINITIONS)
 
 # Seed patterns: SKU stays out of Product Name (NAMING_TEMPLATES_V2 §1 synergy).
-_PATTERN_FITMENT = "{part_type} {installation} {fitment_core} {characteristics} {brand}"
-_PATTERN_UNIVERSAL = "{part_type} {installation} {characteristics} {brand}"
+_PATTERN_FITMENT = "{part_type} {installation} {fitment_core} {attributes} {brand}"
+_PATTERN_UNIVERSAL = "{part_type} {installation} {attributes} {brand}"
 
 
 def physical_template_key(matrix_id: str, applicability: Literal["fitment", "universal"]) -> str:
