@@ -173,3 +173,94 @@ class BatchGenerateNameResponse(BaseModel):
         description="Rows where outcome matched stored hash/name — no DB write.",
     )
     errors: list[BatchNamingErrorItem] = Field(default_factory=list)
+
+
+class NamingPreviewRequest(BaseModel):
+    """
+    Stateless naming preview input (no DB / Odoo).
+
+    Maps catalog row attributes to the pure naming pipeline.
+    """
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    part_type: str = Field(min_length=1, description="Тип детали / категория")
+    brand: str = ""
+    article: str = ""
+    applicability_type: Literal["fitment", "universal"] = "universal"
+    primary_make: str | None = None
+    primary_model: str | None = None
+    primary_body: str | None = None
+    year_from: int | None = None
+    year_to: int | None = None
+    engine: str | None = None
+    side_axis: str | None = None
+    cross_numbers: str | None = None
+    characteristic_parts: list[str] = Field(default_factory=list)
+    installation_location: str | None = None
+    supplier_raw_name: str | None = Field(
+        default=None,
+        description="Сырой текст для search_keywords (не попадает в каноническое имя).",
+    )
+    template_pattern: str | None = Field(
+        default=None,
+        description="Явный name_pattern; без обращения к таблице templates.",
+    )
+    fitments: list[FitmentNamingInput] = Field(default_factory=list)
+    current_name: str | None = Field(
+        default=None,
+        description="Текущее имя в Odoo — только для UI diff, не участвует в генерации.",
+    )
+
+    @field_validator("year_from", "year_to", mode="before")
+    @classmethod
+    def _empty_int_none(cls, v: object) -> object:
+        if v == "":
+            return None
+        return v
+
+    @field_validator("characteristic_parts", mode="before")
+    @classmethod
+    def _normalize_parts(cls, v: object) -> object:
+        if v is None:
+            return []
+        if isinstance(v, str):
+            return [v]
+        return v
+
+    @field_validator("characteristic_parts", mode="after")
+    @classmethod
+    def _strip_parts(cls, v: list[str]) -> list[str]:
+        return [str(x).strip() for x in v if str(x).strip()]
+
+    @model_validator(mode="after")
+    def _primary_hierarchy(self) -> NamingPreviewRequest:
+        if self.applicability_type != "fitment":
+            return self
+        mk = (self.primary_make or "").strip()
+        md = (self.primary_model or "").strip()
+        bd = (self.primary_body or "").strip()
+        if md and not mk:
+            raise ValueError("Primary: модель без марки")
+        if bd and not md:
+            raise ValueError("Primary: поколение без модели")
+        return self
+
+
+class NamingPreviewResponse(BaseModel):
+    """Preview outcome for the operator UI (read-only, no persistence)."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    current_name: str = ""
+    name: str = Field(description="Сгенерированное каноническое имя")
+    search_keywords: str = Field(description="Пул ключевых слов для поиска в Odoo")
+    description: str = ""
+    status: Literal["generated", "review", "error"]
+    warnings: list[str] = Field(default_factory=list)
+    missing_fields: list[str] = Field(default_factory=list)
+    template_pattern_used: str | None = None
+    truncated: bool = False
+    changed: bool = Field(
+        description="True when preview name differs from current_name (trimmed compare).",
+    )

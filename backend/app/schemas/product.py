@@ -60,6 +60,7 @@ class ProductRead(BaseModel):
     name_locked: bool
     generated_name: str | None = None
     synced_at: str | None = None
+    last_sync_error: str | None = None
     error_message: str | None = None
     source_hash: str
     created_at: str

@@ -3,6 +3,8 @@ import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 
 import { CatalogTable } from "@/components/catalog/CatalogTable";
 import { CategoryMapping } from "@/components/categories/CategoryMapping";
+import { MainDashboard } from "@/components/dashboard/MainDashboard";
+import { TemplateBuilder } from "@/components/templates/TemplateBuilder";
 import { AppShell } from "@/components/layout/AppShell";
 import { Toaster } from "@/components/ui/sonner";
 
@@ -21,8 +23,10 @@ export default function App() {
       <QueryClientProvider client={queryClient}>
         <Routes>
           <Route element={<AppShell />}>
-            <Route index element={<CatalogTable />} />
+            <Route index element={<MainDashboard />} />
+            <Route path="catalog" element={<CatalogTable />} />
             <Route path="categories" element={<CategoryMapping />} />
+            <Route path="templates" element={<TemplateBuilder />} />
           </Route>
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

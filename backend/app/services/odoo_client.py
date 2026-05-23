@@ -203,3 +203,67 @@ class OdooClient:
             return False, "Empty res.users read result"
         name = rows[0].get("name") or rows[0].get("login") or "unknown"
         return True, str(name)
+
+    def get_product_template_by_default_code(
+        self,
+        default_code: str,
+        *,
+        fields: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """
+        Fetch a single ``product.template`` row by ``default_code``.
+
+        Returns ``None`` when no matching template exists.
+        """
+        code = default_code.strip()
+        if not code:
+            raise OdooClientError("default_code must be non-empty")
+
+        read_fields = fields or [
+            "id",
+            "name",
+            "default_code",
+            "categ_id",
+            "description_sale",
+        ]
+        rows = self.search_read(
+            "product.template",
+            [["default_code", "=", code]],
+            read_fields,
+            limit=1,
+        )
+        return rows[0] if rows else None
+
+    def read_product_templates_by_ids(
+        self,
+        odoo_ids: list[int],
+        *,
+        fields: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Batch ``product.template`` read by numeric ids (read-only)."""
+        ids = sorted({int(i) for i in odoo_ids if i})
+        if not ids:
+            return []
+        read_fields = fields or ["id", "name", "default_code", "categ_id"]
+        return self.search_read(
+            "product.template",
+            [["id", "in", ids]],
+            read_fields,
+        )
+
+    def search_product_templates_by_category(
+        self,
+        category_id: int,
+        *,
+        fields: list[str] | None = None,
+        limit: int = 3,
+    ) -> list[dict[str, Any]]:
+        """Read-only sample of ``product.template`` rows under a category tree."""
+        read_fields = fields or ["id", "name", "default_code", "categ_id"]
+        return self.search_read(
+            "product.template",
+            [["categ_id", "child_of", category_id]],
+            read_fields,
+            limit=limit,
+            order="random()",
+        )

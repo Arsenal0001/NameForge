@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from sqlalchemy import Boolean, ForeignKeyConstraint, Index, Integer, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
+
+if TYPE_CHECKING:
+    from app.models.fitment import Fitment
+    from app.models.product_fitment import ProductVehicleFitment
 
 
 class Product(Base):
@@ -60,6 +66,7 @@ class Product(Base):
     generated_name: Mapped[str | None] = mapped_column(Text, nullable=True)
     search_keywords: Mapped[str | None] = mapped_column(Text, nullable=True)
     synced_at: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     source_hash: Mapped[str] = mapped_column(Text, nullable=False, default="")
     created_at: Mapped[str] = mapped_column(Text, nullable=False)
@@ -71,5 +78,13 @@ class Product(Base):
         back_populates="product",
         cascade="all, delete-orphan",
         passive_deletes=True,
+        lazy="selectin",
+    )
+    vehicle_fitment: Mapped["ProductVehicleFitment | None"] = relationship(
+        "ProductVehicleFitment",
+        back_populates="product",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        uselist=False,
         lazy="selectin",
     )

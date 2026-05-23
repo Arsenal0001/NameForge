@@ -23,6 +23,7 @@ import json
 import logging
 import re
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -32,20 +33,26 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models.fitment import Fitment
+from app.models.odoo_catalog_cache import OdooCategory, OdooProductTemplate
 from app.models.product import Product
 from app.models.template import Template
 from app.services.category_template_binding import (
+    iter_categories_for_product,
     physical_keys_for_product_matrix,
     resolve_logical_matrix_id,
 )
 from app.services.text_utils import (
     apply_golden_name_postprocess,
     assemble_search_keywords_line,
+    polish_generated_name,
+    sanitize_token_value,
+    STUB_VALUES,
 )
 from app.schemas.naming import (
     FitmentNamingInput,
     GeneratedNamingResult,
     NamingExportManifest,
+    NamingPreviewRequest,
     ProductNamingInput,
 )
 
@@ -64,7 +71,7 @@ class ProductNotFoundError(LookupError):
         super().__init__(str(product_id))
 
 
-SKIP_BRANDS: frozenset[str] = frozenset({"", "non", "?", "н/а", "unknown"})
+SKIP_BRANDS: frozenset[str] = STUB_VALUES
 _VAZ_MODEL_RE = re.compile(r"^\d{4,5}$")
 
 _DEFAULT_FITMENT_FALLBACK = (
@@ -125,7 +132,10 @@ def _coerce_int(v: Any) -> int | None:
 
 
 def skip_brand(brand: str) -> bool:
-    return _str(brand).casefold() in SKIP_BRANDS
+    raw = _str(brand)
+    if not raw:
+        return True
+    return sanitize_token_value(raw) == ""
 
 
 def side_already_in_part_type(part_type: str, side: str) -> bool:
@@ -240,6 +250,21 @@ def _candidate_hash(name: str, description: str, *, search_keywords: str = "") -
         ensure_ascii=False,
     )
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def compute_sync_content_hash(
+    *,
+    name: str,
+    search_keywords: str = "",
+    description: str = "",
+) -> str:
+    """SHA-256 digest of outbound Odoo ``name`` / keywords payload for sync idempotency."""
+    return _candidate_hash(name, description, search_keywords=search_keywords)
+
+
+def _polish_generated_name(name: str) -> str:
+    """Collapse stray whitespace after empty template tokens are removed."""
+    return polish_generated_name(name)
 
 
 def _finalize_visible_name(raw: str) -> tuple[str, bool]:
@@ -357,6 +382,256 @@ def resolve_active_template_pattern(
     return None
 
 
+NamingStatus = Literal["no_template", "pending_sync", "synced"]
+
+
+@dataclass(frozen=True, slots=True)
+class CategoryCacheEntry:
+    """In-memory snapshot of one ``odoo_categories`` row."""
+
+    odoo_id: int
+    name: str
+    parent_id: int | None
+    complete_name: str | None
+    naming_template_key: str | None
+    name_pattern: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TemplateResolution:
+    """Result of cascade template lookup for one product category chain."""
+
+    logical_matrix_id: str | None
+    source_category_id: int | None
+    template_key: str | None
+    template_version: str | None
+    name_pattern: str | None
+    has_category_template: bool
+
+
+class TemplateEngine:
+    """
+    Cascade resolver for Odoo ``product.category`` → naming matrix → SQL ``templates``.
+
+    Category tree is cached in RAM (loaded from ``odoo_categories``). When a leaf
+    category has no ``naming_template_key``, the engine walks ``parent_id`` until a
+    binding is found or the chain ends (global pattern fallback may still apply).
+    """
+
+    def __init__(self) -> None:
+        self._by_id: dict[int, CategoryCacheEntry] = {}
+        self._loaded = False
+
+    def load_categories(self, session: Session) -> None:
+        rows = session.scalars(select(OdooCategory)).all()
+        self._by_id = {
+            row.odoo_id: CategoryCacheEntry(
+                odoo_id=row.odoo_id,
+                name=row.name or "",
+                parent_id=row.parent_id,
+                complete_name=row.complete_name,
+                naming_template_key=(row.naming_template_key or "").strip() or None,
+                name_pattern=(row.name_pattern or "").strip() or None,
+            )
+            for row in rows
+        }
+        self._loaded = True
+
+    def load_from_entries(self, entries: Sequence[CategoryCacheEntry]) -> None:
+        """Test helper — populate cache without DB."""
+        self._by_id = {entry.odoo_id: entry for entry in entries}
+        self._loaded = True
+
+    def ensure_loaded(self, session: Session) -> None:
+        if not self._loaded:
+            self.load_categories(session)
+
+    def invalidate_cache(self) -> None:
+        self._by_id.clear()
+        self._loaded = False
+
+    def walk_category_chain(self, categ_id: int | None) -> list[CategoryCacheEntry]:
+        chain: list[CategoryCacheEntry] = []
+        if categ_id is None:
+            return chain
+        seen: set[int] = set()
+        cid: int | None = categ_id
+        while cid is not None and cid not in seen:
+            seen.add(cid)
+            entry = self._by_id.get(cid)
+            if entry is None:
+                break
+            chain.append(entry)
+            cid = entry.parent_id
+        return chain
+
+    def resolve_matrix_from_category(
+        self, categ_id: int | None
+    ) -> tuple[str | None, int | None]:
+        """Walk leaf→root; return first non-empty ``naming_template_key``."""
+        for entry in self.walk_category_chain(categ_id):
+            if entry.naming_template_key:
+                return entry.naming_template_key, entry.odoo_id
+        return None, None
+
+    def resolve_custom_pattern_from_category(
+        self, categ_id: int | None
+    ) -> tuple[str | None, int | None]:
+        """Walk leaf→root; return first non-empty operator ``name_pattern``."""
+        for entry in self.walk_category_chain(categ_id):
+            if entry.name_pattern:
+                return entry.name_pattern, entry.odoo_id
+        return None, None
+
+    def resolve_categ_id_for_product(
+        self, session: Session, product: Product, *, categ_id: int | None = None
+    ) -> int | None:
+        if categ_id is not None:
+            return categ_id
+        oid_raw = (product.odoo_product_id or "").strip()
+        if oid_raw.isdigit():
+            tpl = session.get(OdooProductTemplate, int(oid_raw))
+            if tpl is not None and tpl.categ_id is not None:
+                return tpl.categ_id
+        for cat in iter_categories_for_product(session, product):
+            return cat.odoo_id
+        return None
+
+    def resolve_for_product(
+        self,
+        session: Session,
+        product: Product,
+        *,
+        categ_id: int | None = None,
+    ) -> TemplateResolution:
+        self.ensure_loaded(session)
+        resolved_categ = self.resolve_categ_id_for_product(
+            session, product, categ_id=categ_id
+        )
+        custom_pattern, custom_src = self.resolve_custom_pattern_from_category(
+            resolved_categ
+        )
+        matrix_id, src_cat = self.resolve_matrix_from_category(resolved_categ)
+
+        appl_raw = _str(product.applicability_type).lower()
+        applicability = "fitment" if appl_raw == "fitment" else "universal"
+
+        template_key: str | None = None
+        template_version: str | None = None
+        pattern: str | None = None
+
+        if custom_pattern:
+            pattern = custom_pattern
+            src_cat = custom_src
+        else:
+            if matrix_id:
+                phys = physical_keys_for_product_matrix(
+                    session,
+                    logical_matrix_id=matrix_id,
+                    applicability_type=applicability,
+                )
+                if phys:
+                    template_key, template_version = phys
+
+            pattern = resolve_active_template_pattern(
+                session,
+                template_key=template_key,
+                applicability_type=applicability,
+                part_type=_str(product.part_type) or None,
+            )
+
+        return TemplateResolution(
+            logical_matrix_id=matrix_id,
+            source_category_id=src_cat,
+            template_key=template_key,
+            template_version=template_version,
+            name_pattern=pattern,
+            has_category_template=bool(custom_pattern or matrix_id),
+        )
+
+
+_template_engine = TemplateEngine()
+
+
+def get_template_engine() -> TemplateEngine:
+    return _template_engine
+
+
+def compute_naming_status(
+    *,
+    has_category_template: bool,
+    preview_name: str,
+    odoo_name: str,
+) -> NamingStatus:
+    if not has_category_template:
+        return "no_template"
+    pn = preview_name.strip()
+    on = odoo_name.strip()
+    if pn and on and pn == on:
+        return "synced"
+    return "pending_sync"
+
+
+def generate_preview_for_product(
+    session: Session,
+    product: Product,
+    *,
+    engine: TemplateEngine | None = None,
+    categ_id: int | None = None,
+) -> tuple[GeneratedNamingResult | None, TemplateResolution]:
+    """
+    Run naming for a loaded product without persistence (spreadsheet preview).
+
+    Returns ``(result, resolution)``. ``result`` is ``None`` on validation errors.
+    """
+    eng = engine or get_template_engine()
+    resolution = eng.resolve_for_product(session, product, categ_id=categ_id)
+
+    fit_orm = sorted(product.fitments, key=lambda f: (f.sort_order, f.id))
+    fit_inputs = fitments_from_orm(fit_orm)
+
+    appl = _str(product.applicability_type).lower()
+    if appl == "fitment" and not fit_inputs:
+        mk = _str(product.primary_make)
+        md = _str(product.primary_model)
+        if mk or md:
+            fit_inputs = [
+                FitmentNamingInput(
+                    make=mk,
+                    model=md,
+                    body=product.primary_body,
+                    year_from=product.year_from,
+                    year_to=product.year_to,
+                    engine=product.engine,
+                    is_primary=True,
+                )
+            ]
+        else:
+            return None, resolution
+
+    try:
+        primary = select_primary_fitment(product.applicability_type, fit_inputs)
+    except NamingValidationError:
+        return None, resolution
+
+    inp = product_from_orm(product)
+    if resolution.template_key and resolution.template_version:
+        inp = inp.model_copy(
+            update={
+                "template_key": resolution.template_key,
+                "template_version": resolution.template_version,
+            }
+        )
+
+    result = generate_naming_result(
+        pattern=resolution.name_pattern,
+        inp=inp,
+        fitments=fit_inputs if appl == "fitment" else [],
+        primary=primary if appl == "fitment" else None,
+    )
+    return result, resolution
+
+
 def fitments_from_orm(rows: Iterable[Fitment]) -> list[FitmentNamingInput]:
     out: list[FitmentNamingInput] = []
     for r in rows:
@@ -464,18 +739,18 @@ def build_fitment_core_phrase(inp: ProductNamingInput, primary: FitmentNamingInp
         return ""
 
     if primary is not None:
-        make = _str(primary.make)
-        model_raw = _str(primary.model)
+        make = sanitize_token_value(_str(primary.make))
+        model_raw = sanitize_token_value(_str(primary.model))
         model = apply_vaz_model_rule(make, model_raw)
-        body = _str(primary.body)
-        years = years_for_name(primary.year_from, primary.year_to)
-        engine = _str(primary.engine)
+        body = sanitize_token_value(_str(primary.body))
+        years = sanitize_token_value(years_for_name(primary.year_from, primary.year_to))
+        engine = sanitize_token_value(_str(primary.engine))
     else:
-        make = _str(inp.primary_make)
-        model = apply_vaz_model_rule(make, _str(inp.primary_model))
-        body = _str(inp.primary_body)
-        years = years_for_name(inp.year_from, inp.year_to)
-        engine = _str(inp.engine)
+        make = sanitize_token_value(_str(inp.primary_make))
+        model = apply_vaz_model_rule(make, sanitize_token_value(_str(inp.primary_model)))
+        body = sanitize_token_value(_str(inp.primary_body))
+        years = sanitize_token_value(years_for_name(inp.year_from, inp.year_to))
+        engine = sanitize_token_value(_str(inp.engine))
 
     parts: list[str] = []
     if make and model:
@@ -496,10 +771,14 @@ def build_fitment_core_phrase(inp: ProductNamingInput, primary: FitmentNamingInp
 
 def build_characteristics_segment(inp: ProductNamingInput) -> str:
     chunks: list[str] = []
-    side = _str(inp.side_axis)
+    side = sanitize_token_value(_str(inp.side_axis))
     if side and not side_already_in_part_type(inp.part_type, side):
         chunks.append(side)
-    chunks.extend(p for p in inp.characteristic_parts if _str(p))
+    chunks.extend(
+        sanitized
+        for part in inp.characteristic_parts
+        if (sanitized := sanitize_token_value(_str(part)))
+    )
     return " ".join(chunks).strip()
 
 
@@ -511,25 +790,33 @@ def build_format_tokens(
     article_primary: str,
     article_cross: list[str],
 ) -> dict[str, str]:
-    brand_val = "" if brand_skipped else _str(inp.brand)
-    installation = _str(inp.installation_location)
+    brand_val = "" if brand_skipped else sanitize_token_value(_str(inp.brand))
+    installation = sanitize_token_value(_str(inp.installation_location))
     chars = build_characteristics_segment(inp)
     fit_core = build_fitment_core_phrase(inp, primary)
 
     make_t = model_t = body_t = years_t = engine_t = ""
     if inp.applicability_type == "fitment":
         if primary is not None:
-            make_t = _str(primary.make)
-            model_t = apply_vaz_model_rule(make_t, _str(primary.model))
-            body_t = _str(primary.body)
-            years_t = years_for_name(primary.year_from, primary.year_to)
-            engine_t = _str(primary.engine)
+            make_t = sanitize_token_value(_str(primary.make))
+            model_t = sanitize_token_value(
+                apply_vaz_model_rule(make_t, _str(primary.model))
+            )
+            body_t = sanitize_token_value(_str(primary.body))
+            years_t = sanitize_token_value(
+                years_for_name(primary.year_from, primary.year_to)
+            )
+            engine_t = sanitize_token_value(_str(primary.engine))
         else:
-            make_t = _str(inp.primary_make)
-            model_t = apply_vaz_model_rule(make_t, _str(inp.primary_model))
-            body_t = _str(inp.primary_body)
-            years_t = years_for_name(inp.year_from, inp.year_to)
-            engine_t = _str(inp.engine)
+            make_t = sanitize_token_value(_str(inp.primary_make))
+            model_t = sanitize_token_value(
+                apply_vaz_model_rule(make_t, _str(inp.primary_model))
+            )
+            body_t = sanitize_token_value(_str(inp.primary_body))
+            years_t = sanitize_token_value(
+                years_for_name(inp.year_from, inp.year_to)
+            )
+            engine_t = sanitize_token_value(_str(inp.engine))
 
     dlya_phrase = ""
     if make_t and model_t:
@@ -540,11 +827,18 @@ def build_format_tokens(
     elif model_t:
         dlya_phrase = model_t
 
+    side_raw = _str(inp.side_axis)
+    side_val = (
+        ""
+        if side_already_in_part_type(inp.part_type, side_raw)
+        else sanitize_token_value(side_raw)
+    )
+
     tokens: dict[str, str] = {
-        "part_type": _str(inp.part_type),
+        "part_type": sanitize_token_value(_str(inp.part_type)),
         "brand": brand_val,
-        "article_primary": article_primary,
-        "article": article_primary,
+        "article_primary": sanitize_token_value(article_primary),
+        "article": sanitize_token_value(article_primary),
         "installation": installation,
         "characteristics": chars,
         "fitment_core": fit_core,
@@ -553,11 +847,11 @@ def build_format_tokens(
         "body": body_t,
         "years": years_t,
         "engine": engine_t,
-        "side": ""
-        if side_already_in_part_type(inp.part_type, _str(inp.side_axis))
-        else _str(inp.side_axis),
-        "cross_numbers": _str(inp.cross_numbers),
-        "article_cross": " | ".join(article_cross) if article_cross else "",
+        "side": side_val,
+        "cross_numbers": sanitize_token_value(_str(inp.cross_numbers)),
+        "article_cross": sanitize_token_value(
+            " | ".join(article_cross) if article_cross else ""
+        ),
         "dlya_segment": dlya_phrase,
     }
     return tokens
@@ -672,6 +966,7 @@ def generate_naming_result(
         chosen_pattern = None
         raw_name = render_with_fallback_structure(inp, tokens)
 
+    raw_name = _polish_generated_name(raw_name)
     cleaned_name = apply_golden_name_postprocess(
         raw_name,
         part_type=_str(inp.part_type),
@@ -708,6 +1003,65 @@ def generate_naming_result(
         missing_fields=missing,
         template_pattern_used=chosen_pattern,
         truncated=truncated,
+    )
+
+
+def preview_naming(request: NamingPreviewRequest) -> GeneratedNamingResult:
+    """
+    Pure naming preview — no DB or Odoo I/O.
+
+    Builds :class:`ProductNamingInput` from the request DTO and delegates to
+    :func:`generate_naming_result`. When ``applicability_type`` is ``fitment`` and
+    ``fitments`` is empty, synthesizes a single primary row from ``primary_*`` fields.
+    """
+    inp = ProductNamingInput(
+        part_type=request.part_type,
+        brand=request.brand,
+        article=request.article,
+        applicability_type=request.applicability_type,
+        side_axis=request.side_axis,
+        cross_numbers=request.cross_numbers,
+        primary_make=request.primary_make,
+        primary_model=request.primary_model,
+        primary_body=request.primary_body,
+        year_from=request.year_from,
+        year_to=request.year_to,
+        engine=request.engine,
+        installation_location=request.installation_location,
+        characteristic_parts=list(request.characteristic_parts),
+        supplier_raw_name=request.supplier_raw_name,
+    )
+
+    fitments = list(request.fitments)
+    if inp.applicability_type == "fitment":
+        if not fitments:
+            mk = _str(inp.primary_make)
+            md = _str(inp.primary_model)
+            if not mk and not md:
+                raise NamingValidationError(
+                    "Для fitment нужны primary_make/primary_model или fitments[]"
+                )
+            fitments = [
+                FitmentNamingInput(
+                    make=mk,
+                    model=md,
+                    body=inp.primary_body,
+                    year_from=inp.year_from,
+                    year_to=inp.year_to,
+                    engine=inp.engine,
+                    is_primary=True,
+                )
+            ]
+        primary = select_primary_fitment(inp.applicability_type, fitments)
+    else:
+        primary = None
+        fitments = []
+
+    return generate_naming_result(
+        pattern=request.template_pattern,
+        inp=inp,
+        fitments=fitments,
+        primary=primary,
     )
 
 

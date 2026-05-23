@@ -50,6 +50,43 @@ _RE_MM_SPACED = re.compile(
 )
 
 
+_RE_SPACE_BEFORE_PUNCT = re.compile(r"\s+([,.])")
+
+STUB_VALUES: frozenset[str] = frozenset(
+    {
+        "",
+        "non",
+        "?",
+        "н/а",
+        "n/a",
+        "без бренда",
+        "no name",
+        "-",
+        "отсутствует",
+        "unknown",
+    }
+)
+
+
+def sanitize_token_value(value: str | None) -> str:
+    """Drop ERP stub/garbage tokens; return cleaned value or empty string."""
+    cleaned = (value or "").strip()
+    if not cleaned:
+        return ""
+    if cleaned.casefold() in STUB_VALUES:
+        return ""
+    return cleaned
+
+
+def polish_generated_name(name: str) -> str:
+    """Final whitespace pass after template placeholders collapse to empty strings."""
+    if not name:
+        return ""
+    polished = re.sub(r"\s+", " ", name)
+    polished = _RE_SPACE_BEFORE_PUNCT.sub(r"\1", polished)
+    return polished.strip()
+
+
 def collapse_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip())
 
@@ -216,4 +253,5 @@ def apply_golden_name_postprocess(
     x = remove_words_subsumed_in_part_type(x, part_type)
     x = strip_article_tokens_from_name(x, article_primary)
     x = dedupe_consecutive_words(x)
+    x = polish_generated_name(x)
     return collapse_whitespace(x)

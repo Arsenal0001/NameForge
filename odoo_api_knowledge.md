@@ -1,113 +1,91 @@
-# 📄 Памятка для разработчиков: Интеграция с Odoo 19.4a1 через API (Stateless Direct Execution)
+# Odoo API integration — NameForge 2.0
 
-## 📌 1. Контекст и статус
+## 1. Environment
 
-**Версия системы:** Odoo 19.4a1 Community (с модулями Roles и Nginx proxy).
-**Проблема:** Стандартные эндпоинты авторизации (`/xmlrpc/2/common` и `/web/session/authenticate`) возвращают `AccessDenied` (`result: false`) при использовании валидных API-ключей.
-**Статус решения:** Утвержден архитектурный обходной путь (Workaround) — **Direct JSON-RPC Execution**.
+| Item | Value |
+|------|--------|
+| **Odoo version** | **19.0 Community** (stable), VPS `https://erp.arszap.ru` |
+| **Database** | `stable_arszap` |
+| **Protocol** | **JSON-RPC only** — `POST {ODOO_URL}/jsonrpc`, method `execute_kw` |
+| **API account** | Dedicated user for NameForge 2.0 (not operator UI login) |
 
-## 🚨 2. Директивы для AI (Cursor Rules)
+NameForge 2.0 (FastAPI + React) runs **locally**; Odoo is remote. Deploy of 2.0 to VPS is planned later.
 
-*При написании любого кода для взаимодействия с Odoo в этом проекте, ИИ обязан строго следовать этим правилам:*
+## 2. Mandatory rules for all Odoo code
 
-1. **ЗАПРЕЩЕНО** использовать методы `common.authenticate` или `/web/session/authenticate`.
-2. **ЗАПРЕЩЕНО** использовать библиотеку `xmlrpc.client`. Все запросы должны идти через JSON-RPC с использованием библиотеки `requests`.
-3. **ОБЯЗАТЕЛЬНО** использовать прямой вызов метода `execute_kw` к эндпоинту `/jsonrpc`.
-4. **ОБЯЗАТЕЛЬНО** передавать учетные данные (Database, UID, API Key) непосредственно в теле каждого RPC-вызова `execute_kw`. UID должен быть задан явно (через `.env`), так как сервер не отдаст его через методы авторизации.
+1. **Do not** use `common.authenticate`, `/web/session/authenticate`, or cookie sessions.
+2. **Do not** use `xmlrpc.client`. Use `requests` + JSON-RPC.
+3. **Always** call `execute_kw` on service `object` via `/jsonrpc`.
+4. **Always** pass `(db, uid, api_secret, model, method, args, kwargs)` in every RPC call.
+5. **Always** read credentials from project-root `.env` via `backend/app/core/config.py`.
+6. **All Odoo HTTP** goes only through `backend/app/services/odoo_client.py`.
 
-## 🐛 3. Корень проблемы (Root Cause - Для справки)
+## 3. Client implementation
 
-В сборке 19.4a1 архитектура авторизации сломана сторонними и системными модулями:
-
-* **Модули 2FA (auth_totp_mail):** При stateless API-запросе ожидают наличия ключа `type` в словаре `credentials`, вызывая `KeyError`, если его нет.
-* **Модули прав доступа (Roles):** Перехватывают метод `_login` и используют `self.sudo()`. Это сбрасывает контекст пользователя (например, с вашего `uid=2` на системный `uid=1`). Ядро Odoo проверяет API-ключ для `uid=1`, не находит его и блокирует доступ.
-
-## 🛠 4. Архитектура решения (Stateless Direct Execution)
-
-Чтобы обойти сломанный слой маршрутизации `_login`, мы работаем напрямую с Object-сервисом Odoo, самостоятельно собирая пакет `execute_kw`.
-
-### Шаблон базового клиента (`odoo_client.py`)
-
-Этот класс является эталонным для любых интеграций в рамках проекта:
+Canonical client: `backend/app/services/odoo_client.py` (`OdooClient`).
 
 ```python
-"""JSON-RPC клиент для Odoo (Direct execute_kw Bypass)."""
-import requests
-import logging
-
-logger = logging.getLogger(__name__)
-
-class OdooDirectClient:
-    def __init__(self, url: str, db: str, uid: int, api_key: str):
-        self.url = f"{url.rstrip('/')}/jsonrpc"
-        self.db = db
-        self.uid = uid          # Явно заданный UID (например, 2)
-        self.api_key = api_key  # 40-значный API ключ
-        self.session = requests.Session() # Для connection pooling
-        self._id = 0
-
-    def call(self, model: str, method: str, args: list = None, kwargs: dict = None):
-        """Прямой вызов ORM методов в обход контроллера авторизации."""
-        self._id += 1
-        payload = {
-            "jsonrpc": "2.0",
-            "id": self._id,
-            "method": "call",
-            "params": {
-                "service": "object",
-                "method": "execute_kw",
-                "args": [
-                    self.db, 
-                    self.uid, 
-                    self.api_key, 
-                    model, 
-                    method, 
-                    args or [], 
-                    kwargs or {}
-                ]
-            }
-        }
-        
-        try:
-            response = self.session.post(self.url, json=payload, timeout=30).json()
-        except requests.RequestException as e:
-            logger.error(f"Network error: {e}")
-            raise
-
-        if "error" in response:
-            error_msg = response["error"].get("data", {}).get("message", response["error"])
-            raise RuntimeError(f"Odoo RPC Error: {error_msg}")
-            
-        return response.get("result")
-
-    def test_connection(self) -> bool:
-        """Метод для проверки валидности API-ключа без authenticate()."""
-        try:
-            result = self.call("res.users", "read", [[self.uid], ["name"]])
-            if result:
-                logger.info(f"✅ Успешное подключение. Пользователь: {result[0]['name']}")
-                return True
-            return False
-        except Exception as e:
-            logger.error(f"❌ Ошибка проверки связи: {e}")
-            return False
-
+payload = {
+    "jsonrpc": "2.0",
+    "id": rpc_id,
+    "method": "call",
+    "params": {
+        "service": "object",
+        "method": "execute_kw",
+        "args": [db, uid, api_secret, model, method, positional_args, keyword_args],
+    },
+}
 ```
 
-## ⚙️ 5. Переменные окружения (`.env`)
+Helper methods:
 
-Для работы интеграции требуется наличие следующих переменных:
+- `search_read(model, domain, fields, limit=…)` — catalog reads
+- `get_product_template_by_default_code(default_code)` — smoke test / lookup by SKU
+- `test_connection()` — `res.users.read` for configured `ODOO_UID`
+
+## 4. Environment variables (`.env`)
 
 ```ini
+DATABASE_URL=sqlite:///./data/autoname.db
 ODOO_URL=https://erp.arszap.ru
-ODOO_DB=autoparts_arszap
-ODOO_UID=2  # ВАЖНО: Целочисленный ID пользователя, сгенерировавшего ключ
-ODOO_API_KEY=ваш_40_значный_ключ_без_пробелов
-
+ODOO_DB=stable_arszap
+ODOO_UID=5
+ODOO_API_KEY=
+ODOO_USER=nameforge-api@example.com
+ODOO_PASSWORD=
 ```
 
-## 💡 6. Лучшие практики работы с каталогом
+| Variable | Required | Notes |
+|----------|----------|--------|
+| `ODOO_URL` | yes | Base URL without trailing slash |
+| `ODOO_DB` | yes | Odoo database name |
+| `ODOO_UID` | yes | Integer `res.users.id` of the API account |
+| `ODOO_API_KEY` | preferred | 40-char API key from Odoo user profile |
+| `ODOO_PASSWORD` | fallback | Used as RPC secret when `ODOO_API_KEY` is empty |
+| `ODOO_USER` | optional | Login label for documentation / ops |
 
-* **Первичный ключ:** При импорте товаров всегда использовать поле `default_code` в качестве первичного ключа для поиска записей (во избежание дублей).
-* **Изображения:** Поле `image_1920` принимает строку формата `base64` (декодированную в `utf-8`).
-* **Пакетная обработка:** Из-за особенностей ORM Odoo, при загрузке больших массивов данных (10k+ записей) рекомендуется загружать их чанками (например, по 100-500 штук), чтобы не упираться в таймауты Nginx.
+**Secret resolution:** `ODOO_API_KEY` if set, else `ODOO_PASSWORD`.
+
+## 5. Verification endpoints (local FastAPI)
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /api/odoo/ping` | Auth + connectivity via `res.users.read` |
+| `GET /api/odoo/product-template?default_code=DISC` | Read one `product.template` by article |
+
+Example:
+
+```bash
+curl "http://127.0.0.1:8000/api/odoo/product-template?default_code=DISC"
+```
+
+## 6. Catalog best practices
+
+- **Primary key for import:** `default_code` (article / SKU).
+- **Chunked reads:** `search_read` in batches of 100–500 to avoid Nginx timeouts.
+- **Writes:** respect local `name_locked` and idempotency before pushing names to Odoo.
+- **Pure naming logic:** generation stays in `template_service` / naming modules — no Odoo I/O inside generators.
+
+## 7. Why direct `execute_kw` (historical note)
+
+On some alpha builds, `authenticate` and session login failed with custom auth modules (2FA, Roles). Stable **19.0 Community** on `erp.arszap.ru` works with a dedicated API user + explicit `ODOO_UID` + API key via direct `execute_kw`. Session-based login remains **out of scope** for NameForge 2.0.

@@ -22,10 +22,16 @@ export function AppShell() {
         </div>
         <nav className="flex flex-col gap-1 p-3">
           <NavLink to="/" end className={linkClass}>
+            Главный дашборд
+          </NavLink>
+          <NavLink to="/catalog" className={linkClass}>
             Каталог товаров
           </NavLink>
           <NavLink to="/categories" className={linkClass}>
             Настройка категорий
+          </NavLink>
+          <NavLink to="/templates" className={linkClass}>
+            Управление шаблонами
           </NavLink>
         </nav>
       </aside>

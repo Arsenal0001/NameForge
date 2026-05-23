@@ -21,6 +21,7 @@ from app.models.odoo_catalog_cache import (
 )
 from app.models.product import Product
 from app.services.odoo_client import OdooClient, OdooClientError
+from app.services.template_service import get_template_engine
 
 logger = logging.getLogger(__name__)
 
@@ -159,16 +160,31 @@ def sync_odoo_catalog(
     stats["odoo_product_templates"] = _sync_product_templates(
         session, client, chunk_size=chunk_size
     )
+    get_template_engine().invalidate_cache()
     return stats
 
 
-def _sync_categories(
-    session: Session, client: OdooClient, *, chunk_size: int
-) -> int:
+def sync_odoo_categories(
+    session: Session,
+    client: OdooClient,
+    *,
+    chunk_size: int = 200,
+) -> dict[str, int]:
+    """
+    Upsert ``product.category`` rows into ``odoo_categories``.
+
+    Preserves operator bindings: ``name_pattern`` and ``naming_template_key`` are
+    never overwritten on existing rows.
+    """
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be >= 1")
+
     fields = ["id", "name", "parent_id", "complete_name"]
-    total = 0
     offset = 0
     synced_at = utc_iso_timestamp()
+    inserted = 0
+    updated = 0
+
     while True:
         rows = client.search_read(
             "product.category",
@@ -184,17 +200,32 @@ def _sync_categories(
             oid = int(row["id"])
             obj = session.get(OdooCategory, oid)
             if obj is None:
-                obj = OdooCategory(odoo_id=oid)
+                obj = OdooCategory(odoo_id=oid, synced_at=synced_at)
                 session.add(obj)
+                inserted += 1
+            else:
+                updated += 1
             obj.name = str(row.get("name") or "")
             obj.parent_id = _many2one_id(row.get("parent_id"))
             obj.complete_name = _text_or_none(row.get("complete_name"))
             obj.synced_at = synced_at
-            total += 1
         session.commit()
-        logger.info("Synced %s product.category rows (offset=%s)", len(rows), offset)
+        logger.info(
+            "Synced %s product.category rows (offset=%s)", len(rows), offset
+        )
         offset += len(rows)
-    return total
+
+    get_template_engine().invalidate_cache()
+    total = inserted + updated
+    return {"inserted": inserted, "updated": updated, "total": total}
+
+
+def _sync_categories(
+    session: Session, client: OdooClient, *, chunk_size: int
+) -> int:
+    """Backward-compatible wrapper returning total row count."""
+    stats = sync_odoo_categories(session, client, chunk_size=chunk_size)
+    return int(stats["total"])
 
 
 def _sync_product_attributes(

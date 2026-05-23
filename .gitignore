@@ -21,3 +21,5 @@ data/odoo_master_catalog.xlsx
 
 logs/
 analysis_output.json
+debug.log
+*.log

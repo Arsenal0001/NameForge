@@ -15,6 +15,7 @@ from app.schemas.category import (
     PutCategoryTemplateBody,
 )
 from app.services.naming_matrices import NAMING_MATRIX_DEFINITIONS, is_valid_matrix_id
+from app.services.template_service import get_template_engine
 
 router = APIRouter(prefix="/categories", tags=["categories"])
 
@@ -31,12 +32,14 @@ def _category_search_clause(q: str | None):
 
 def _to_row(c: OdooCategory) -> CategoryRow:
     key = (c.naming_template_key or "").strip() or None
+    pattern = (c.name_pattern or "").strip() or None
     return CategoryRow(
         odoo_id=c.odoo_id,
         name=c.name or "",
         complete_name=c.complete_name,
         parent_id=c.parent_id,
         naming_template_key=key,
+        name_pattern=pattern,
     )
 
 
@@ -111,4 +114,5 @@ def put_category_template(
     db.add(cat)
     db.commit()
     db.refresh(cat)
+    get_template_engine().invalidate_cache()
     return _to_row(cat)

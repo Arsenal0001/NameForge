@@ -18,6 +18,7 @@ class OdooCategory(Base):
     parent_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     complete_name: Mapped[str | None] = mapped_column(Text, nullable=True)
     naming_template_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    name_pattern: Mapped[str | None] = mapped_column(Text, nullable=True)
     synced_at: Mapped[str] = mapped_column(Text, nullable=False)
 
 

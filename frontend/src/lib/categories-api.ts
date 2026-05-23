@@ -10,6 +10,7 @@ export type CategoryRow = {
   complete_name: string | null;
   parent_id: number | null;
   naming_template_key: string | null;
+  name_pattern: string | null;
 };
 
 export type CategoryListPage = {

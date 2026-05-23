@@ -3,31 +3,14 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.models.product import Product
-from app.schemas.catalog_product import ProductCatalogItem, ProductCatalogPage
-from app.services.category_template_binding import resolve_logical_matrix_id
+from app.schemas.catalog_product import NamingStatus, ProductCatalogPage
+from app.services.catalog_enrichment import enrich_catalog_items
+from app.services.catalog_query import CatalogListFilters, query_catalog_products
 
 router = APIRouter(prefix="/products", tags=["catalog"])
-
-
-def _row_from_product(db: Session, p: Product) -> ProductCatalogItem:
-    name = (p.generated_name or "").strip()
-    category = (p.product_folder or "").strip()
-    matrix_id = resolve_logical_matrix_id(db, p)
-    return ProductCatalogItem(
-        id=p.id,
-        article=p.article or "",
-        name=name,
-        category=category,
-        brand=p.brand or "",
-        name_locked=bool(p.name_locked),
-        category_template_bound=bool(matrix_id),
-        search_keywords=(p.search_keywords or "").strip(),
-    )
 
 
 @router.get("", response_model=ProductCatalogPage)
@@ -36,20 +19,43 @@ def list_products(
     *,
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    search: str | None = Query(
+        default=None,
+        max_length=200,
+        description="Case-insensitive match across article, codes, preview and Odoo name",
+    ),
+    naming_status: NamingStatus | None = Query(
+        default=None,
+        description="Filter by naming status (SQL approximation aligned with grid badges)",
+    ),
+    is_locked: bool | None = Query(default=None, description="Filter by name_locked flag"),
+    has_error: bool | None = Query(
+        default=None,
+        description="When true, only rows with last_sync_error set",
+    ),
 ) -> ProductCatalogPage:
-    """Серверная пагинация списка товаров для таблицы каталога."""
-    total = db.scalar(select(func.count()).select_from(Product))
-    if total is None:
-        total = 0
+    """
+    Серверная пагинация каталога с обогащением из Odoo и TemplateEngine.
 
-    stmt = select(Product).order_by(Product.id.asc()).offset(offset).limit(limit)
-    rows = db.scalars(stmt).all()
-
-    items = [_row_from_product(db, p) for p in rows]
+    Фильтры применяются в SQL до ``limit`` / ``offset``.
+    """
+    filters = CatalogListFilters(
+        search=search,
+        naming_status=naming_status,
+        is_locked=is_locked,
+        has_error=has_error,
+    )
+    rows, total = query_catalog_products(
+        db,
+        filters=filters,
+        offset=offset,
+        limit=limit,
+    )
+    items = enrich_catalog_items(db, rows)
 
     return ProductCatalogPage(
         items=items,
-        total_count=int(total),
+        total_count=total,
         limit=limit,
         offset=offset,
     )

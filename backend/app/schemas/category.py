@@ -24,6 +24,10 @@ class CategoryRow(BaseModel):
         None,
         description="Logical matrix id; null if operator cleared the binding.",
     )
+    name_pattern: str | None = Field(
+        None,
+        description="Operator-edited naming formula bound to this category.",
+    )
 
 
 class CategoryListPage(BaseModel):
